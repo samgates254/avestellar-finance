@@ -148,16 +148,33 @@ python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
 - `POST /api/v1/integrations/n8n/webhook/` - Inbound n8n execution webhook
 
 ### Financial Intelligence & AI Assistant
+- `GET /api/v1/analytics/financial-dashboard/` - Unified executive financial intelligence dashboard
+- `GET /api/v1/analytics/metrics/` - Registered metric catalog with formulas, units, and limitations
+- `GET /api/v1/analytics/profitability/` - Multi-tier margins, gross/net revenue, EBIT, EBITDA reconciliation bridge
+- `GET|POST /api/v1/analytics/capital-expenditure/` - CAPEX tracking, project records, CAPEX-to-revenue/depreciation
+- `GET /api/v1/analytics/returns/` - ROA, ROE, ROIC, and ROCE return metrics
+- `GET /api/v1/analytics/liquidity-leverage/` - Working Capital, Current/Quick/Cash ratios, Total/Net Debt, Interest Coverage
+- `GET /api/v1/analytics/efficiency/` - Inventory Turnover, DIO, Receivables Turnover, DSO, DPO, Cash Conversion Cycle
+- `POST /api/v1/analytics/calculators/npv/` - Deterministic Net Present Value calculation
+- `POST /api/v1/analytics/calculators/irr/` - Hybrid Newton-Raphson / Bisection IRR numerical solver
+- `POST /api/v1/analytics/calculators/investment/` - Comprehensive investment appraisal suite (NPV, IRR, Payback, PI)
+- `POST /api/v1/analytics/calculators/break-even/` - Single-product Contribution Margin, Break-Even, Margin of Safety
+- `POST /api/v1/analytics/calculators/break-even-multiproduct/` - Multi-product composite break-even sales mix
+- `GET|POST /api/v1/analytics/scenarios/` - Pro-forma financial scenario simulations (strictly ledger-immutable)
+- `GET|POST /api/v1/analytics/account-mappings/` - Organization-specific Chart of Accounts classification mappings
+- `GET /api/v1/analytics/account-mappings/completeness/` - Chart of accounts mapping completeness audit
 - `GET /api/v1/analytics/cash-flow/` - Cash flow liquidity and 30-day projection
 - `GET /api/v1/analytics/receivables-aging/` - 30-day aging brackets
 - `GET /api/v1/analytics/anomalies/` - Anomaly and financial risk detection
 - `GET /api/v1/analytics/ai/management-summary/` - Deterministic AI executive summary
 - `GET /api/v1/analytics/ai/explain-pnl/` - Narrative P&L explanation
+- `GET /api/v1/analytics/ai/explain-ebitda/` - Reconciled EBITDA bridge narrative explanation
 
 ---
 
-## 7. Integrations
+## 7. Documentation & Integrations
 
+- Comprehensive Financial Metrics Catalog: [docs/financial_metrics_catalog.md](file:///home/mr-robot/Projects/avestellar-finance/docs/financial_metrics_catalog.md)
 - Detailed n8n setup and HMAC signature verification: [docs/n8n_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/n8n_integration.md)
 - MauzoPilot adapter and Data Flywheel specification: [docs/mauzopilot_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/mauzopilot_integration.md)
 - Complete Architectural Specifications: [docs/architecture_and_flywheel.md](file:///home/mr-robot/Projects/avestellar-finance/docs/architecture_and_flywheel.md)

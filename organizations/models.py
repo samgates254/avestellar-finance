@@ -29,6 +29,10 @@ class Organization(models.Model):
         db_table = "organizations"
         ordering = ["name"]
 
+    @property
+    def base_currency(self) -> str:
+        return self.currency
+
     def __str__(self) -> str:
         return f"{self.name} ({self.currency})"
 
