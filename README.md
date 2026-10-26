@@ -1,0 +1,169 @@
+# AVESTELLAR FINANCE
+
+**Intelligent Financial Operating System & Accounting Backend**  
+*AVESTELLAR TECHNOLOGIES*
+
+---
+
+## 1. Executive Summary
+
+AVESTELLAR FINANCE is an API-first accounting, double-entry general ledger, and financial intelligence backend. It combines rigorous double-entry accounting invariants, multi-tenant SaaS architecture, transactional outbox event streaming, MauzoPilot integration adapters, and deterministic AI financial analysis in a maintainable modular monolith.
+
+---
+
+## 2. Technology Stack
+
+- **Language**: Python 3.14
+- **Framework**: Django 5.2 LTS & Django REST Framework 3.16
+- **Database**: PostgreSQL 16 (via `psycopg 3.3.6`)
+- **Authentication**: JWT (`djangorestframework-simplejwt 5.5`)
+- **API Documentation**: OpenAPI 3.0 via `drf-spectacular 0.28`
+- **Environment**: `django-environ 0.12`
+- **Testing**: `pytest 9.1`, `pytest-django 4.14`, and `httpx 0.28`
+
+---
+
+## 3. Core Architecture & Modules
+
+```
+avestellar-finance/
+├── identity/          # Custom User model, JWT authentication, user profiles
+├── organizations/     # Multi-tenant scoping, roles (Owner, Admin, Accountant, Viewer)
+├── ledger/            # Chart of Accounts, Accounting Periods, Journal Entries, Reports
+├── invoicing/         # Customers, Sales Invoices, Lines, AR recognition
+├── purchases/         # Suppliers, Vendor Bills, Accounts Payable
+├── payments/          # Payment settlement, partial payments, deposit reconciliation
+├── automation/        # Transactional outbox, webhook subscriptions, HMAC signatures
+├── integrations/      # MauzoPilot adapter, canonical object mappings, n8n receiver
+├── analytics/         # Cash flow liquidity, receivables aging, anomaly detection, AI assistant
+├── auditlog/          # Audit trail tracking for sensitive financial mutations
+├── config/            # Django settings, root routing, OpenAPI schema, health check
+├── docs/              # Integration and architecture guides
+└── tests/             # Comprehensive automated test suite
+```
+
+---
+
+## 4. Getting Started
+
+### 4.1 Prerequisites
+- Python 3.14+
+- PostgreSQL 16+ running locally or in Docker
+
+### 4.2 Configuration
+Copy the environment template:
+```bash
+cp .env.example .env
+```
+
+Ensure your PostgreSQL database is created:
+```bash
+# Example local postgres connection
+export PGPASSWORD=avestellar
+psql -h 127.0.0.1 -p 5433 -U avestellar -c "CREATE DATABASE avestellar_finance;"
+```
+
+Update `.env` database URL:
+```ini
+DATABASE_URL=postgresql://avestellar:avestellar@127.0.0.1:5433/avestellar_finance
+```
+
+### 4.3 Database Migrations
+Apply migrations to PostgreSQL:
+```bash
+python manage.py migrate
+```
+
+### 4.4 Start the Development Server
+```bash
+python manage.py runserver 0.0.0.0:8000
+```
+
+Access the interactive OpenAPI Documentation at:
+- Swagger UI: `http://localhost:8000/api/docs/`
+- ReDoc: `http://localhost:8000/api/redoc/`
+- Schema JSON/YAML: `http://localhost:8000/api/schema/`
+
+---
+
+## 5. Verification & Testing
+
+Run all automated checks:
+```bash
+# 1. Django system check
+python manage.py check
+
+# 2. Check for unapplied migrations
+python manage.py makemigrations --check --dry-run
+python manage.py migrate --check
+
+# 3. Run full automated test suite (24 tests)
+pytest -q
+
+# 4. Validate OpenAPI documentation schema
+python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
+```
+
+---
+
+## 6. Key API Endpoints (`/api/v1/`)
+
+### Authentication & Identity
+- `POST /api/v1/auth/register/` - Register new user
+- `POST /api/v1/auth/token/` - Obtain JWT token pair
+- `POST /api/v1/auth/token/refresh/` - Refresh JWT token
+- `GET /api/v1/auth/me/` - Retrieve authenticated user profile
+
+### Organizations & Multi-Tenancy
+- `GET /api/v1/organizations/` - List organizations for current user
+- `POST /api/v1/organizations/` - Create organization and initialize default Chart of Accounts
+- `GET /api/v1/organizations/<id>/` - Retrieve organization details
+- `GET /api/v1/organizations/<id>/members/` - List organization members
+- `POST /api/v1/organizations/<id>/members/` - Add user to organization with role
+
+### Double-Entry General Ledger
+- `GET /api/v1/ledger/accounts/` - Chart of Accounts
+- `POST /api/v1/ledger/accounts/` - Create ledger account
+- `GET /api/v1/ledger/periods/` - List accounting periods
+- `POST /api/v1/ledger/periods/<id>/close/` - Close accounting period
+- `GET /api/v1/ledger/journals/` - Query journal entries
+- `POST /api/v1/ledger/journals/` - Create draft journal entry with lines
+- `POST /api/v1/ledger/journals/<id>/post/` - Validate and post entry atomically
+- `POST /api/v1/ledger/journals/<id>/reverse/` - Execute accounting reversal
+
+### Financial Statements
+- `GET /api/v1/reports/trial-balance/` - Trial Balance
+- `GET /api/v1/reports/income-statement/` - Income Statement (P&L)
+- `GET /api/v1/reports/balance-sheet/` - Balance Sheet (Assets = Liabilities + Equity)
+
+### Invoicing & Payments
+- `GET|POST /api/v1/invoicing/customers/` - Customer directory
+- `GET|POST /api/v1/invoicing/invoices/` - Sales invoices with line items
+- `POST /api/v1/invoicing/invoices/<id>/issue/` - Issue invoice and post AR journal
+- `GET|POST /api/v1/payments/` - Record and settle customer/supplier payments
+
+### Automation & Webhooks
+- `GET|POST /api/v1/automation/webhooks/` - Manage webhook subscriptions
+- `GET /api/v1/automation/outbox/` - Inspect transactional outbox events
+- `POST /api/v1/integrations/n8n/webhook/` - Inbound n8n execution webhook
+
+### Financial Intelligence & AI Assistant
+- `GET /api/v1/analytics/cash-flow/` - Cash flow liquidity and 30-day projection
+- `GET /api/v1/analytics/receivables-aging/` - 30-day aging brackets
+- `GET /api/v1/analytics/anomalies/` - Anomaly and financial risk detection
+- `GET /api/v1/analytics/ai/management-summary/` - Deterministic AI executive summary
+- `GET /api/v1/analytics/ai/explain-pnl/` - Narrative P&L explanation
+
+---
+
+## 7. Integrations
+
+- Detailed n8n setup and HMAC signature verification: [docs/n8n_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/n8n_integration.md)
+- MauzoPilot adapter and Data Flywheel specification: [docs/mauzopilot_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/mauzopilot_integration.md)
+- Complete Architectural Specifications: [docs/architecture_and_flywheel.md](file:///home/mr-robot/Projects/avestellar-finance/docs/architecture_and_flywheel.md)
+
+---
+
+## 8. License & Support
+
+Confidential and Proprietary. Copyright © 2026 AVESTELLAR TECHNOLOGIES. All rights reserved.
