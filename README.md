@@ -97,7 +97,7 @@ python manage.py check
 python manage.py makemigrations --check --dry-run
 python manage.py migrate --check
 
-# 3. Run full automated test suite (24 tests)
+# 3. Run full automated test suite (82 passing tests)
 pytest -q
 
 # 4. Validate OpenAPI documentation schema
@@ -142,10 +142,17 @@ python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
 - `POST /api/v1/invoicing/invoices/<id>/issue/` - Issue invoice and post AR journal
 - `GET|POST /api/v1/payments/` - Record and settle customer/supplier payments
 
+### Integrations & Canonical Data Flywheel
+- `GET|PATCH /api/v1/integrations/mauzopilot/config/` - Manage MauzoPilot connector credentials, business ID, and active state
+- `POST /api/v1/integrations/mauzopilot/test-connection/` - Upstream ping to `/api/health/` verifying tokens and latency
+- `POST /api/v1/integrations/mauzopilot/sync/` - On-demand incremental synchronization of customers and sales
+- `GET /api/v1/integrations/mauzopilot/mappings/` - Inspect canonical external ID mappings
+- `GET /api/v1/integrations/health/` - Comprehensive integration telemetry (MauzoPilot, Daraja, Outbox queues)
+- `POST /api/v1/integrations/n8n/webhook/` - Inbound n8n execution webhook (HMAC-SHA256 authenticated)
+
 ### Automation & Webhooks
-- `GET|POST /api/v1/automation/webhooks/` - Manage webhook subscriptions
+- `GET|POST /api/v1/automation/webhooks/` - Manage outbound webhook subscriptions
 - `GET /api/v1/automation/outbox/` - Inspect transactional outbox events
-- `POST /api/v1/integrations/n8n/webhook/` - Inbound n8n execution webhook
 
 ### Financial Intelligence & AI Assistant
 - `GET /api/v1/analytics/financial-dashboard/` - Unified executive financial intelligence dashboard
@@ -170,14 +177,40 @@ python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
 - `GET /api/v1/analytics/ai/explain-pnl/` - Narrative P&L explanation
 - `GET /api/v1/analytics/ai/explain-ebitda/` - Reconciled EBITDA bridge narrative explanation
 
+### Statement Imports & Bank Reconciliation
+- `GET|POST /api/v1/payments/statement-imports/` - Upload and ingest Bank CSV, M-Pesa CSV, OFX, and MT940 files with SHA-256 deduplication
+- `GET /api/v1/payments/statement-imports/<id>/` - Retrieve import batch details, validation summary, and transactions
+- `GET /api/v1/payments/reconciliation/unreconciled/` - Accountant review queue of unmatched statement lines
+- `GET /api/v1/payments/reconciliation/candidates/<id>/` - Ranked match candidates with rule explanations and scores
+- `POST /api/v1/payments/reconciliation/match/` - Confirm proposed or manual match and trigger atomic GL settlement
+- `POST /api/v1/payments/reconciliation/investigate/` - Flag transaction for manual investigation
+- `GET|POST /api/v1/payments/reconciliation/sessions/` - Reconciliation sessions tracking statement vs GL balances
+- `GET /api/v1/payments/reconciliation/sessions/<id>/` - Session details and variance analysis
+- `POST /api/v1/payments/reconciliation/sessions/<id>/finalize/` - Lock and finalize reconciliation session
+- `POST /api/v1/payments/reconciliation/sessions/<id>/reopen/` - Authorized reopening of finalized session
+
+### Safaricom Daraja M-Pesa Integration
+- `GET|PATCH /api/v1/integrations/daraja/config/` - Manage Daraja credentials and deposit clearing accounts
+- `POST /api/v1/integrations/daraja/c2b-confirmation/` - Asynchronous C2B payment confirmation webhook (replay-resistant)
+- `POST /api/v1/integrations/daraja/c2b-validation/` - Asynchronous C2B validation webhook
+- `POST /api/v1/integrations/daraja/stk-callback/` - Lipa Na M-Pesa Online (STK Push) callback handler
+- `POST /api/v1/integrations/daraja/verify-status/` - Safaricom Daraja transaction status verification query
+
 ---
 
-## 7. Documentation & Integrations
+## 7. Documentation & Architecture References
 
+- MauzoPilot Verified Integration: [docs/mauzopilot_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/mauzopilot_integration.md)
+- Canonical Data Flywheel Architecture: [docs/data_flywheel.md](file:///home/mr-robot/Projects/avestellar-finance/docs/data_flywheel.md)
+- n8n Automation Workflows: [docs/n8n_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/n8n_integration.md)
+- Integration Operations & Telemetry: [docs/integration_operations.md](file:///home/mr-robot/Projects/avestellar-finance/docs/integration_operations.md)
+- Payment Boundary & Verification Security: [docs/payment_integration_security.md](file:///home/mr-robot/Projects/avestellar-finance/docs/payment_integration_security.md)
+- Deterministic Reconciliation Engine: [docs/reconciliation_engine.md](file:///home/mr-robot/Projects/avestellar-finance/docs/reconciliation_engine.md)
+- Bank Statement Imports (CSV, OFX, MT940): [docs/bank_statement_imports.md](file:///home/mr-robot/Projects/avestellar-finance/docs/bank_statement_imports.md)
+- Safaricom M-Pesa Statement Reconciliation: [docs/mpesa_reconciliation.md](file:///home/mr-robot/Projects/avestellar-finance/docs/mpesa_reconciliation.md)
+- Safaricom Daraja Callback Integration: [docs/daraja_callback_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/daraja_callback_integration.md)
 - Comprehensive Financial Metrics Catalog: [docs/financial_metrics_catalog.md](file:///home/mr-robot/Projects/avestellar-finance/docs/financial_metrics_catalog.md)
-- Detailed n8n setup and HMAC signature verification: [docs/n8n_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/n8n_integration.md)
-- MauzoPilot adapter and Data Flywheel specification: [docs/mauzopilot_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/mauzopilot_integration.md)
-- Complete Architectural Specifications: [docs/architecture_and_flywheel.md](file:///home/mr-robot/Projects/avestellar-finance/docs/architecture_and_flywheel.md)
+- Core Architectural Specifications: [docs/architecture_and_flywheel.md](file:///home/mr-robot/Projects/avestellar-finance/docs/architecture_and_flywheel.md)
 
 ---
 

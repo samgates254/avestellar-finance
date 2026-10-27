@@ -1,6 +1,7 @@
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
@@ -87,6 +88,89 @@ class MauzoPilotMappingListView(APIView):
 
 @extend_schema_view(
     post=extend_schema(
+        summary="Trigger MauzoPilot Incremental Synchronization",
+        description="Initiates an on-demand incremental pull of updated customers and sales records from MauzoPilot.",
+        request=None,
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+)
+class MauzoPilotSyncTriggerView(APIView):
+    permission_classes = (permissions.IsAuthenticated, IsOrgAdminOrOwner)
+
+    def post(self, request):
+        org = get_request_organization(request, self)
+        if not org:
+            return Response({"detail": "Active organization context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        adapter = MauzoPilotAdapter(organization=org)
+        summary = adapter.run_incremental_sync()
+        return Response(summary.to_dict(), status=status.HTTP_200_OK)
+
+
+@extend_schema_view(
+    get=extend_schema(
+        summary="Get Integration Health and Observability Status",
+        description="Comprehensive operational telemetry for MauzoPilot connector, Daraja boundary, and transactional outbox queues.",
+        responses={200: OpenApiTypes.OBJECT},
+    )
+)
+class IntegrationHealthOverviewView(APIView):
+    permission_classes = (permissions.IsAuthenticated, IsOrganizationMember)
+
+    def get(self, request):
+        from automation.models import OutboxEvent, OutboxStatus, WebhookDelivery, DeliveryStatus
+        from integrations.models import DarajaConfig
+
+        org = get_request_organization(request, self)
+        if not org:
+            return Response({"detail": "Active organization context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        mp_cfg = MauzoPilotConfig.objects.filter(organization=org).first()
+        daraja_cfg = DarajaConfig.objects.filter(organization=org).first()
+
+        pending_outbox = OutboxEvent.objects.filter(
+            organization=org, status=OutboxStatus.PENDING
+        ).count()
+        failed_deliveries = WebhookDelivery.objects.filter(
+            subscription__organization=org, status=DeliveryStatus.FAILED
+        ).count()
+
+        mp_connected = False
+        if mp_cfg and mp_cfg.is_active and mp_cfg.api_key:
+            # Check fast connectivity status
+            adapter = MauzoPilotAdapter(organization=org)
+            conn = adapter.test_connection()
+            mp_connected = bool(conn.get("connected", False))
+
+        health_data = {
+            "organization_id": str(org.id),
+            "organization_name": org.name,
+            "mauzopilot": {
+                "enabled": bool(mp_cfg and mp_cfg.is_active),
+                "connected": mp_connected,
+                "business_id": mp_cfg.business_id if mp_cfg else "",
+                "status": mp_cfg.last_sync_status if mp_cfg else "UNCONFIGURED",
+                "last_sync_at": mp_cfg.last_sync_at.isoformat() if mp_cfg and mp_cfg.last_sync_at else None,
+                "customer_sync_cursor": mp_cfg.customer_sync_cursor.isoformat() if mp_cfg and mp_cfg.customer_sync_cursor else None,
+                "sale_sync_cursor": mp_cfg.sale_sync_cursor.isoformat() if mp_cfg and mp_cfg.sale_sync_cursor else None,
+                "consecutive_failures": mp_cfg.consecutive_failure_count if mp_cfg else 0,
+                "last_error": mp_cfg.last_sync_error if mp_cfg else "",
+            },
+            "daraja": {
+                "enabled": bool(daraja_cfg and daraja_cfg.is_active),
+                "is_sandbox": bool(daraja_cfg and daraja_cfg.is_sandbox),
+                "short_code": daraja_cfg.short_code if daraja_cfg else "",
+            },
+            "outbox": {
+                "pending_events_count": pending_outbox,
+                "failed_deliveries_count": failed_deliveries,
+            },
+        }
+        return Response(health_data, status=status.HTTP_200_OK)
+
+
+@extend_schema_view(
+    post=extend_schema(
         summary="n8n Inbound Webhook Execution Endpoint",
         description="Receives automated workflow events from n8n with HMAC signature verification and routes through financial services.",
         request=OpenApiTypes.OBJECT,
@@ -97,6 +181,9 @@ class N8nInboundWebhookView(APIView):
     permission_classes = (permissions.AllowAny,)
 
     def post(self, request):
+        from invoicing.models import Invoice, InvoiceStatus
+        from payments.models import StatementReconciliationStatus, StatementTransaction
+
         org_id = request.headers.get("X-Organization-ID") or request.data.get("organization_id")
         if not org_id:
             return Response({"detail": "X-Organization-ID header is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -107,8 +194,14 @@ class N8nInboundWebhookView(APIView):
 
         cfg = MauzoPilotConfig.objects.filter(organization=org).first()
         if cfg and cfg.webhook_secret:
-            sig = request.headers.get("X-Avestellar-Signature", "")
-            ts = request.headers.get("X-Avestellar-Timestamp", "")
+            sig = (
+                request.headers.get("X-Avestellar-Signature")
+                or request.headers.get("X-Webhook-Signature", "")
+            )
+            ts = (
+                request.headers.get("X-Avestellar-Timestamp")
+                or request.headers.get("X-Webhook-Timestamp", "")
+            )
             if not sig or not ts or not verify_webhook_signature(cfg.webhook_secret, ts, request.body, sig):
                 return Response({"detail": "Invalid or expired webhook signature."}, status=status.HTTP_401_UNAUTHORIZED)
 
@@ -124,9 +217,212 @@ class N8nInboundWebhookView(APIView):
                 invoice = adapter.sync_sales_order_to_draft_invoice(payload)
                 return Response({"status": "SUCCESS", "invoice_id": str(invoice.id), "invoice_number": invoice.invoice_number})
             elif action == "confirm_payment":
-                payment = adapter.sync_payment_collection(payload)
-                return Response({"status": "SUCCESS", "payment_id": str(payment.id), "amount": str(payment.amount)})
+                from payments.services.verification import process_collection_with_verification
+                payment, is_settled = process_collection_with_verification(
+                    organization=org,
+                    external_payment_data=payload,
+                )
+                if not is_settled:
+                    return Response(
+                        {
+                            "status": "HELD_FOR_REVIEW",
+                            "payment_id": str(payment.id),
+                            "payment_status": payment.status,
+                            "detail": "Payment recorded as pending verification. Ledger settlement requires verified provider reference, statement match, or authorized cash policy.",
+                        },
+                        status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    )
+                return Response(
+                    {
+                        "status": "SUCCESS",
+                        "payment_id": str(payment.id),
+                        "amount": str(payment.amount),
+                        "payment_status": payment.status,
+                        "verified": True,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+            elif action == "trigger_sync":
+                summary = adapter.run_incremental_sync()
+                return Response({"status": "SUCCESS", "summary": summary.to_dict()})
+            elif action == "query_reconciliation_exceptions":
+                exceptions = StatementTransaction.objects.filter(
+                    organization=org,
+                    reconciliation_status__in=[
+                        StatementReconciliationStatus.UNRECONCILED,
+                        StatementReconciliationStatus.INVESTIGATION,
+                    ],
+                ).values("id", "transaction_date", "description", "signed_amount", "currency", "reconciliation_status")[:50]
+                return Response({"status": "SUCCESS", "exceptions": list(exceptions)})
+            elif action == "query_overdue_invoices":
+                today = timezone.now().date()
+                overdue = Invoice.objects.filter(
+                    organization=org,
+                    status__in=[InvoiceStatus.ISSUED, InvoiceStatus.PARTIALLY_PAID],
+                    due_date__lt=today,
+                ).values("id", "invoice_number", "customer__name", "total_amount", "outstanding_balance", "due_date")[:50]
+                return Response({"status": "SUCCESS", "overdue_invoices": list(overdue)})
             else:
                 return Response({"detail": f"Unrecognized action '{action}'."}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             return Response({"status": "ERROR", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@extend_schema_view(
+    get=extend_schema(
+        summary="Get Daraja M-Pesa Configuration",
+        description="Retrieve Safaricom Daraja payment integration credentials and settings.",
+        responses={200: OpenApiTypes.OBJECT},
+    ),
+    patch=extend_schema(
+        summary="Update Daraja M-Pesa Configuration",
+        description="Update Daraja shortcode, consumer key, passkey, and active status.",
+        request=OpenApiTypes.OBJECT,
+        responses={200: OpenApiTypes.OBJECT},
+    ),
+)
+class DarajaConfigView(APIView):
+    permission_classes = (permissions.IsAuthenticated, IsOrgAdminOrOwner)
+
+    def get(self, request):
+        from integrations.models import DarajaConfig
+        from integrations.serializers import DarajaConfigSerializer
+
+        org = get_request_organization(request, self)
+        config, _ = DarajaConfig.objects.get_or_create(organization=org)
+        return Response(DarajaConfigSerializer(config).data)
+
+    def patch(self, request):
+        from integrations.models import DarajaConfig
+        from integrations.serializers import DarajaConfigSerializer
+
+        org = get_request_organization(request, self)
+        config, _ = DarajaConfig.objects.get_or_create(organization=org)
+        serializer = DarajaConfigSerializer(config, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+def _resolve_daraja_org(request) -> Organization | None:
+    """Resolves target organization from header, query param, or BusinessShortCode."""
+    from integrations.models import DarajaConfig
+
+    org_id = request.headers.get("X-Organization-ID") or request.query_params.get("organization_id")
+    if org_id:
+        return Organization.objects.filter(id=org_id, is_active=True).first()
+
+    short_code = request.data.get("BusinessShortCode")
+    if short_code:
+        cfg = DarajaConfig.objects.filter(short_code=short_code, organization__is_active=True).first()
+        if cfg:
+            return cfg.organization
+
+    return None
+
+
+@extend_schema_view(
+    post=extend_schema(
+        summary="Safaricom Daraja C2B Confirmation Callback",
+        description="Receives asynchronous C2B transaction confirmation callbacks from Safaricom M-Pesa with replay protection.",
+        request=OpenApiTypes.OBJECT,
+        responses={200: OpenApiTypes.OBJECT},
+    )
+)
+class DarajaC2BConfirmationWebhookView(APIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        from integrations.adapters.daraja import process_c2b_callback
+
+        org = _resolve_daraja_org(request)
+        if not org:
+            return Response(
+                {"ResultCode": "1", "ResultDesc": "Organization context could not be resolved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        resp = process_c2b_callback(organization=org, payload=request.data, is_validation=False)
+        return Response(resp, status=status.HTTP_200_OK)
+
+
+@extend_schema_view(
+    post=extend_schema(
+        summary="Safaricom Daraja C2B Validation Callback",
+        description="Receives asynchronous C2B validation callbacks from Safaricom M-Pesa to validate customer accounts.",
+        request=OpenApiTypes.OBJECT,
+        responses={200: OpenApiTypes.OBJECT},
+    )
+)
+class DarajaC2BValidationWebhookView(APIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        from integrations.adapters.daraja import process_c2b_callback
+
+        org = _resolve_daraja_org(request)
+        if not org:
+            return Response(
+                {"ResultCode": "C2B00012", "ResultDesc": "Invalid Organization"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        resp = process_c2b_callback(organization=org, payload=request.data, is_validation=True)
+        return Response(resp, status=status.HTTP_200_OK)
+
+
+@extend_schema_view(
+    post=extend_schema(
+        summary="Safaricom Daraja STK Push Callback",
+        description="Receives asynchronous Lipa Na M-Pesa Online (STK Push) callbacks.",
+        request=OpenApiTypes.OBJECT,
+        responses={200: OpenApiTypes.OBJECT},
+    )
+)
+class DarajaStkCallbackWebhookView(APIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        from integrations.adapters.daraja import process_stk_callback
+
+        org = _resolve_daraja_org(request)
+        if not org:
+            return Response(
+                {"ResultCode": "1", "ResultDesc": "Organization context could not be resolved."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        resp = process_stk_callback(organization=org, payload=request.data)
+        return Response(resp, status=status.HTTP_200_OK)
+
+
+@extend_schema_view(
+    post=extend_schema(
+        summary="Query Safaricom Daraja Transaction Status",
+        description="Queries Safaricom Daraja Transaction Status API for payment verification.",
+        request=OpenApiTypes.OBJECT,
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+)
+class DarajaVerifyTransactionStatusView(APIView):
+    permission_classes = (permissions.IsAuthenticated, IsOrganizationMember)
+
+    def post(self, request):
+        from integrations.adapters.daraja import DarajaClient
+        from integrations.models import DarajaConfig
+        from integrations.serializers import DarajaVerifyStatusRequestSerializer
+
+        org = get_request_organization(request, self)
+        if not org:
+            return Response({"detail": "Active organization context required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = DarajaVerifyStatusRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        config = DarajaConfig.objects.filter(organization=org).first()
+        client = DarajaClient(config=config)
+        result = client.query_transaction_status(
+            transaction_id=serializer.validated_data["transaction_id"],
+            short_code=serializer.validated_data.get("short_code"),
+        )
+        return Response(result, status=status.HTTP_200_OK)

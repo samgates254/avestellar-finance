@@ -1,3 +1,5 @@
+"""Payment recording and settlement services."""
+
 import uuid
 from decimal import Decimal
 from django.db import transaction
@@ -29,6 +31,7 @@ def record_and_confirm_customer_payment(
     reference: str = "",
     user=None,
     idempotency_key: str = "",
+    existing_payment: Payment | None = None,
 ) -> Payment:
     """Records and settles a customer payment against an issued invoice.
 
@@ -45,7 +48,7 @@ def record_and_confirm_customer_payment(
         raise ValueError("Payment amount must be strictly greater than zero.")
 
     invoice = (
-        Invoice.objects.select_for_update()
+        Invoice.objects.select_for_update(of=("self",))
         .select_related("organization", "customer")
         .get(id=invoice_id)
     )
@@ -92,21 +95,44 @@ def record_and_confirm_customer_payment(
 
     pay_num = payment_number or f"PAY-{uuid.uuid4().hex[:8].upper()}"
 
-    # 1. Create Payment Record
-    payment = Payment.objects.create(
-        organization=invoice.organization,
-        payment_number=pay_num,
-        payment_type=PaymentType.CUSTOMER_PAYMENT,
-        customer=invoice.customer,
-        invoice=invoice,
-        amount=amount,
-        currency=invoice.currency,
-        payment_date=today,
-        payment_method=payment_method,
-        status=PaymentStatus.CONFIRMED,
-        reference=reference,
-        deposit_account=deposit_account,
-    )
+    # 1. Create a new Payment, or promote the existing pending record in place.
+    # Keeping its primary key preserves integration mappings and callback links.
+    if existing_payment is not None:
+        payment = Payment.objects.select_for_update().get(
+            id=existing_payment.id,
+            organization=invoice.organization,
+        )
+        if payment.status != PaymentStatus.PENDING:
+            raise ValueError(
+                f"Payment {payment.payment_number} cannot be confirmed: "
+                f"expected PENDING, found '{payment.status}'."
+            )
+        if payment.invoice_id != invoice.id:
+            raise ValueError("Pending payment invoice does not match the settlement invoice.")
+        if payment.amount != amount or payment.currency != invoice.currency:
+            raise ValueError("Pending payment amount or currency does not match the settlement obligation.")
+        if payment.payment_method != payment_method:
+            raise ValueError("Pending payment method does not match the settlement method.")
+        payment.customer = invoice.customer
+        payment.payment_date = today
+        payment.status = PaymentStatus.CONFIRMED
+        payment.deposit_account = deposit_account
+        payment.save(update_fields=["customer", "payment_date", "status", "deposit_account"])
+    else:
+        payment = Payment.objects.create(
+            organization=invoice.organization,
+            payment_number=pay_num,
+            payment_type=PaymentType.CUSTOMER_PAYMENT,
+            customer=invoice.customer,
+            invoice=invoice,
+            amount=amount,
+            currency=invoice.currency,
+            payment_date=today,
+            payment_method=payment_method,
+            status=PaymentStatus.CONFIRMED,
+            reference=reference,
+            deposit_account=deposit_account,
+        )
 
     # 2. Create Journal Entry
     je_number = f"JE-PAY-{pay_num}"

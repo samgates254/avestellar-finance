@@ -1,146 +1,96 @@
-# n8n Integration Guide: AVESTELLAR FINANCE
+# n8n Automation Workflows & Webhook Integration Guide
 
-This guide explains how to connect **n8n** automation workflows to **AVESTELLAR FINANCE** using secure, signed, and idempotent HTTP webhook contracts.
-
----
-
-## 1. Architecture Overview
-
-AVESTELLAR FINANCE is designed as an API-first financial platform. External systems such as n8n interact with AVESTELLAR FINANCE strictly through **versioned REST APIs (`/api/v1/`)** and **transactional webhook events**.
-
-**Direct database connections are prohibited.** Every mutating event passes through AVESTELLAR FINANCE's domain services, where tenant scoping, role-based authorization, idempotency, and double-entry invariants are enforced.
-
-```
-+---------------+           Outbound Webhooks (HMAC-SHA256)           +---------------+
-|  AVESTELLAR   | --------------------------------------------------> |      n8n      |
-|    FINANCE    |                                                     |   Workflows   |
-|   (Backend)   | <-------------------------------------------------- |               |
-+---------------+              Authenticated Inbound REST API         +---------------+
-```
+This guide details how **n8n** automation workflows interact with **AVESTELLAR FINANCE** via secure REST endpoints and HMAC-SHA256 authenticated webhooks.
 
 ---
 
-## 2. Inbound Webhooks: Calling AVESTELLAR FINANCE from n8n
+## 1. Architectural Guardrails
 
-### 2.1 Inbound Endpoint
+1. **Zero Direct Database Access**: All actions must pass through AVESTELLAR FINANCE's domain services via `/api/v1/` REST endpoints or the `/api/v1/integrations/n8n/webhook/` endpoint.
+2. **Tenant Isolation**: Every inbound request must provide an active `X-Organization-ID` header matching the authorized token context or signed organization. Cross-organization access is rejected.
+3. **Double-Entry Integrity**: External workflow engines cannot directly post journal lines. Workflows interact through business operations (`issue_invoice`, `record_and_confirm_customer_payment`), ensuring every posted transaction is balanced ($\sum \text{Dr} = \sum \text{Cr}$).
+4. **HMAC Signature Verification & Replay Protection**:
+   - Outbound and inbound payloads are signed using HMAC-SHA256 over `${timestamp}.${raw_body}`.
+   - Timestamps older than 300 seconds are rejected immediately.
+
+---
+
+## 2. Inbound Webhook: Calling AVESTELLAR FINANCE from n8n
+
+### Endpoint
 - **URL**: `POST /api/v1/integrations/n8n/webhook/`
 - **Headers**:
   - `Content-Type: application/json`
   - `X-Organization-ID: <ORGANIZATION_UUID>`
-  - `X-Avestellar-Signature: <HMAC_SHA256_HEX>` *(if webhook secret is configured)*
-  - `X-Avestellar-Timestamp: <UNIX_TIMESTAMP>` *(within 300s)*
+  - `X-Avestellar-Signature: <HMAC_SHA256_HEX>` (or `X-Webhook-Signature`)
+  - `X-Avestellar-Timestamp: <UNIX_TIMESTAMP>` (or `X-Webhook-Timestamp`)
 
-### 2.2 Supported Actions & Payloads
+### Supported Inbound Actions
 
-#### Action A: Sync Customer
-```json
-{
-  "action": "sync_customer",
-  "payload": {
-    "id": "ext-cust-501",
-    "name": "Nairobi Solar Tech Ltd",
-    "email": "billing@nairobisolar.ke",
-    "phone": "+254711998877",
-    "tax_pin": "P051234567Z"
-  }
-}
-```
-
-#### Action B: Sync Confirmed Sales Order to Draft Invoice
-```json
-{
-  "action": "sync_sales_order",
-  "payload": {
-    "id": "ORD-2026-9901",
-    "status": "confirmed",
-    "customer": {
-      "id": "ext-cust-501",
-      "name": "Nairobi Solar Tech Ltd"
-    },
-    "items": [
-      {
-        "description": "5kW Solar Inverter",
-        "quantity": "2",
-        "unit_price": "85000.00",
-        "tax_rate": "0.16"
-      }
-    ]
-  }
-}
-```
-
-#### Action C: Confirm Payment Collection
-```json
-{
-  "action": "confirm_payment",
-  "payload": {
-    "id": "PAY-MPESA-QAB789",
-    "order_id": "ORD-2026-9901",
-    "amount": "197200.00",
-    "payment_method": "MPESA",
-    "reference": "QAB789XYZ"
-  }
-}
-```
+| Action | Payload Key Details | Resulting System Behavior |
+| :--- | :--- | :--- |
+| `sync_customer` | `{"id": "...", "name": "...", "email": "...", "phone": "..."}` | Idempotently syncs customer, creates `ExternalObjectMapping`, emits `customer.synchronized`. |
+| `sync_sales_order` | `{"id": "...", "status": "completed", "items": [...]}` | Creates draft invoice with line items, emits `sale.received`. |
+| `confirm_payment` | `{"id": "...", "order_id": "...", "amount": "...", "reference": "..."}` | Issues invoice if draft, settles receivable, posts GL entry, emits `payment.confirmed`. |
+| `trigger_sync` | `{}` | Runs on-demand incremental pull from MauzoPilot. Returns detailed `SyncSummary`. |
+| `query_reconciliation_exceptions` | `{}` | Returns unreconciled statement transactions requiring human attention. |
+| `query_overdue_invoices` | `{}` | Returns list of issued/partially paid invoices where `due_date < today`. |
 
 ---
 
-## 3. Outbound Webhooks: Consuming AVESTELLAR FINANCE Events in n8n
+## 3. The 5 Core Automation Workflows
 
-### 3.1 Subscribing to Events
-Register an outbound webhook subscription via API:
-```bash
-POST /api/v1/automation/webhooks/
-Headers:
-  Authorization: Bearer <JWT_ACCESS_TOKEN>
-  X-Organization-ID: <ORGANIZATION_UUID>
-  Content-Type: application/json
+### Workflow A: Customer Synchronization
+- **Trigger**: New customer registration in MauzoPilot or external CRM.
+- **Workflow Steps**:
+  1. Webhook node receives customer data.
+  2. n8n HTTP Request node calls `POST /api/v1/integrations/n8n/webhook/` with action `sync_customer`.
+  3. AVESTELLAR FINANCE resolves `ExternalObjectMapping`, updates/creates `Customer`, and returns canonical ID.
+  4. n8n records external mapping in downstream CRM/ERP.
 
-Body:
-{
-  "target_url": "https://n8n.yourcompany.com/webhook/finance-events",
-  "secret": "your-secure-shared-hmac-secret-32-chars",
-  "events": ["invoice.issued", "payment.confirmed", "journal.posted"],
-  "is_active": true
-}
-```
+### Workflow B: Invoice Collection (Overdue Escalation)
+- **Trigger**: Daily cron (e.g., 08:00 EAT) in n8n.
+- **Workflow Steps**:
+  1. n8n calls `POST /api/v1/integrations/n8n/webhook/` with action `query_overdue_invoices`.
+  2. AVESTELLAR FINANCE returns overdue invoices with balance and customer details.
+  3. Filter node partitions invoices by aging brackets (1–30 days, 31–60 days, >60 days).
+  4. Sends automated WhatsApp reminder via Infobip/Twilio or sends finance reminder email.
+  5. Records reminder event in customer audit history.
 
-### 3.2 Canonical Event Envelope
-Every event emitted by AVESTELLAR FINANCE adheres to this envelope:
-```json
-{
-  "event_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-  "event_type": "payment.confirmed",
-  "schema_version": "v1",
-  "occurred_at": "2026-10-26T21:45:00.123456Z",
-  "organization_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-  "source_system": "avestellar.finance",
-  "correlation_id": "c73a03f2-472c-4d83-9b87-73d8ab5b4974",
-  "idempotency_key": "idemp-pay-4491",
-  "payload": {
-    "payment_id": "0df81e1b-85d8-4f1b-88a2-2b62719a8491",
-    "payment_number": "PAY-MP-8831",
-    "invoice_id": "8f36a5c1-654d-4e92-bd17-91950e32aa76",
-    "invoice_number": "INV-2026-001",
-    "amount": "174000.0000",
-    "currency": "KES",
-    "payment_method": "MPESA",
-    "reference": "QA12345678",
-    "invoice_remaining_balance": "0.0000",
-    "invoice_status": "PAID"
-  }
-}
-```
+### Workflow C: Payment Reconciliation
+- **Trigger**: Daraja M-Pesa C2B Confirmation or Bank webhook.
+- **Workflow Steps**:
+  1. Transaction arrives at AVESTELLAR FINANCE callback.
+  2. If matched automatically, invoice is marked PAID and `payment.confirmed` is emitted.
+  3. If unallocated or ambiguous, `payment.verification_required` is emitted to the outbox.
+  4. n8n catches the outbox webhook and alerts the finance operations Slack channel with match suggestions.
+  5. Operator approves match via Slack Interactive Button $\rightarrow$ n8n calls `POST /api/v1/payments/reconciliation/apply/`.
 
-### 3.3 Verifying Webhook Signatures in n8n (Code Node)
-In your n8n workflow, insert a **Code Node (JavaScript)** directly after the Webhook Node:
+### Workflow D: Financial Exception Escalation
+- **Trigger**: Outbox event `financial.exception` or reconciliation engine discrepancy.
+- **Workflow Steps**:
+  1. Outbound webhook fires to n8n endpoint.
+  2. n8n verifies HMAC signature.
+  3. Opens high-priority Jira/Linear ticket for the Senior Financial Controller.
+  4. Preserves transaction reference, raw statement narrative, and discrepancy amount.
+
+### Workflow E: Financial Intelligence & Liquidity Alerts
+- **Trigger**: Scheduled weekly analytics job or outbox event `analytics.material_condition`.
+- **Workflow Steps**:
+  1. n8n queries `/api/v1/analytics/working-capital/` and `/api/v1/analytics/cash-flow/`.
+  2. Evaluates Altman Z-Score and Quick Ratio against organization safety thresholds.
+  3. If working capital drops below threshold or runway $< 60$ days, formats an Executive Briefing PDF and delivers it to the CFO.
+
+---
+
+## 4. Webhook Verification Example in n8n (JavaScript Code Node)
 
 ```javascript
 const crypto = require('crypto');
 
 const secret = $env.AVESTELLAR_WEBHOOK_SECRET;
-const receivedSignature = $headers['x-avestellar-signature'];
-const timestamp = $headers['x-avestellar-timestamp'];
+const receivedSignature = $headers['x-avestellar-signature'] || $headers['x-webhook-signature'];
+const timestamp = $headers['x-avestellar-timestamp'] || $headers['x-webhook-timestamp'];
 const rawPayload = JSON.stringify($json);
 
 // Check timestamp replay window (5 minutes = 300 seconds)
@@ -159,23 +109,3 @@ if (receivedSignature !== expectedSignature) {
 
 return [{ json: { verified: true, event: $json } }];
 ```
-
----
-
-## 4. Planned n8n Automation Workflows
-
-1. **Invoice Overdue Escalation**:
-   - Webhook trigger: `invoice.issued` or daily scheduled poll of `/api/v1/analytics/receivables-aging/`.
-   - Action: Send WhatsApp reminder or email alert if an invoice moves into the > 30 days overdue bracket.
-
-2. **M-Pesa Payment Notification & Settlement**:
-   - Webhook trigger: Payment receipt event from M-Pesa.
-   - Action: Call `/api/v1/integrations/n8n/webhook/` with `confirm_payment`.
-   - Result: Automatically settles the receivable, posts general ledger entries, and notifies the account manager.
-
-3. **Customer Synchronization**:
-   - MauzoPilot operational event -> n8n workflow -> AVESTELLAR FINANCE checks canonical external mapping table -> Creates Customer if new.
-
-4. **Cash Balance Alert**:
-   - Hourly/Daily n8n Cron calls `/api/v1/analytics/cash-flow/`.
-   - If `projected_net_cash` drops below organization threshold, send Slack notification to CFO.

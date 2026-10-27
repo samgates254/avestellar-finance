@@ -1,110 +1,128 @@
 # MauzoPilot Integration Guide: AVESTELLAR FINANCE
 
-This document specifies the integration architecture between **MauzoPilot** (the operational sales and inventory engine) and **AVESTELLAR FINANCE** (the double-entry Financial Operating System).
+This document specifies the integration architecture between **MauzoPilot** (the operational sales, POS, and inventory engine) and **AVESTELLAR FINANCE** (the double-entry Financial Operating System).
 
 ---
 
-## 1. The AVESTELLAR Data Flywheel
+## 1. Verified Upstream MauzoPilot Architecture & Endpoints
 
-The operational synergy follows this documented cycle:
+Based on verified local source inspection of the MauzoPilot Django backend (`/home/mr-robot/Projects/mauzopilot`), the integration communicates directly with the following production endpoints:
 
+| Endpoint | Method | Purpose | Verified Query Params / Payload |
+| :--- | :--- | :--- | :--- |
+| `/api/health/` | `GET` | Upstream connectivity & health ping | None. Returns `{"status": "ok"}` |
+| `/api/businesses/<uuid:business_id>/customers/` | `GET` | Incremental Customer Synchronization | `updated_since=<ISO_8601>`. Returns customer array with `id`, `name`, `phone`, `email`, `credit_limit_cents`, `balance_cents`, `is_active`, `updated_at_utc`. |
+| `/api/businesses/<uuid:business_id>/sales/` | `GET` | Incremental Sales Synchronization | `received_since=<ISO_8601>&after_id=<UUID>`. Returns sales array with line items, `total_cents`, `paid_cents`, `payment_method`, `lines` (`product_name`, `sku`, `unit_price_cents`, `quantity`). |
+| `/api/businesses/<uuid:business_id>/cash-entries/` | `GET` | Daily till register & cash flow verification | `created_since=<ISO_8601>`. |
+
+### Authentication Scheme
+- Header: `Authorization: Token <api_key>`
+- Client Identifiers: `X-Client-System: avestellar-finance`
+- Correlation Tracking: `X-Correlation-ID: ag-<uuid_hex>`
+
+---
+
+## 2. Canonical Data Ownership & Accounting Boundaries
+
+An explicit boundary prevents conflicting financial records or corrupted ledger state:
+
+| Domain Entity | Authoritative System | Integration Role in AVESTELLAR FINANCE |
+| :--- | :--- | :--- |
+| **Point-of-Sale (POS) & Orders** | MauzoPilot | Ingested as operational sales record. Triggers creation of a **DRAFT invoice** (`InvoiceStatus.DRAFT`). |
+| **Product Catalog & Stock** | MauzoPilot | Referenced on invoice line items for item description, SKU, and unit rate. |
+| **Shop Customers & CRM** | MauzoPilot | Synced via `ExternalObjectMapping`. Creates or updates internal `Customer` record. |
+| **General Ledger & Double-Entry** | AVESTELLAR FINANCE | Authoritative source of truth for accounts receivable, revenue recognition, sales tax (VAT), and settlement. |
+| **Invoices & Receivables** | AVESTELLAR FINANCE | Validates commercial lines, applies tax rules, computes aging, and tracks payment settlement. |
+| **Payment Settlement** | AVESTELLAR FINANCE | Verified through banking/M-Pesa integration (`Payment`). Posts debit to Cash/Bank/Clearing and credit to Accounts Receivable. |
+| **Financial Intelligence & Analytics** | AVESTELLAR FINANCE | Calculates cash flow forecasting, Dupont analysis, Altman Z-Score, and publishes risk alerts. |
+
+### Strict Invariants
+1. **Never Invent Production Endpoints**: All API interactions map strictly to verified routes under `/api/businesses/<business_id>/`.
+2. **Draft Financial Documents First**: An external sales order never immediately writes to the general ledger without validation. It is stored as a draft invoice until validated or auto-settled with proof of payment.
+3. **Integer Cents to Decimal Conversion**: MauzoPilot expresses all monetary values in integer Kenya shillings cents ($1\text{ KES} = 100\text{ cents}$). AVESTELLAR FINANCE enforces high-precision `Decimal(18, 4)`:
+   $$\text{Amount}_{\text{KES}} = \frac{\text{cents}}{100}$$
+4. **Idempotent Ingestion**: Every external entity is recorded in `ExternalObjectMapping`. Repeated sync runs identify existing mappings and update existing records without creating duplicates.
+5. **Separation of Initiation and Settlement**: Payment claims from external POS systems require matching against verified receipts or bank/clearing accounts.
+
+---
+
+## 3. Incremental Synchronization & Cursor Management
+
+The connector employs persistent, organization-scoped synchronization cursors on `MauzoPilotConfig`:
+
+- `customer_sync_cursor`: `DateTimeField` tracking `updated_at_utc` of the latest ingested customer. Sent as `?updated_since=<cursor>` on subsequent runs.
+- `sale_sync_cursor`: `DateTimeField` tracking `received_at_utc` of the latest received sale.
+- `sale_after_id`: `UUIDField` breaking ties when multiple sales share identical arrival timestamps. Sent as `?received_since=<cursor>&after_id=<uuid>`.
+
+### Cursor Progression Workflow
 ```
-MauzoPilot Operational Activity (Sales, Orders, Deliveries)
-      │
-      ▼
-Validated Integration Events (HMAC, Timestamp, Idempotency)
-      │
-      ▼
-Canonical Financial Records (Customers, Invoices, Payments)
-      │
-      ▼
-Verified Ledger & Settlement (Double-Entry General Ledger Postings)
-      │
-      ▼
-Financial Intelligence & Forecasting (Cash Flow, Aging, Margins)
-      │
-      ▼
-Approved Insights Returned to MauzoPilot (Customer Balance, Credit Limits)
-      │
-      ▼
-Improved Operational & Sales Decisions
+[Start Sync]
+    │
+    ├─► GET /api/businesses/<business_id>/customers/?updated_since=<cursor>
+    │     └─► Iterate records -> sync_customer() -> Advance customer_sync_cursor
+    │
+    └─► GET /api/businesses/<business_id>/sales/?received_since=<cursor>&after_id=<after_id>
+          └─► Iterate records -> sync_sales_order_to_draft_invoice()
+                ├─► If sale paid (paid_cents >= total_cents):
+                │     └─► sync_payment_collection() -> Post to GL (Dr Cash/Clearing, Cr AR)
+                └─► Advance sale_sync_cursor & sale_after_id
 ```
 
 ---
 
-## 2. Core Invariants & Boundaries
+## 4. Error Handling, Rate Limiting & Safe Retries
 
-1. **Explicit Data Ownership**:
-   - MauzoPilot is authoritative for operational order capture, catalog items, and point-of-sale actions.
-   - AVESTELLAR FINANCE is authoritative for financial accounting, receivables recognition, tax calculations, ledger balances, and audit records.
-2. **No Unvalidated Ledger Writes**:
-   - A sales order received from MauzoPilot creates a **DRAFT invoice**.
-   - An accounting entry is only recognized in the ledger when the invoice is validated and formally issued.
-3. **Canonical Object Mapping**:
-   - The `ExternalObjectMapping` table links `mauzopilot:sales_order:<id>` to internal `invoice:<uuid>`, and `mauzopilot:customer:<id>` to internal `customer:<uuid>`.
-   - Repeated ingestion of the same external identifier is strictly idempotent.
-4. **Credential Security**:
-   - Upstream API keys and secrets are stored in protected environment variables and the `MauzoPilotConfig` model.
-   - Credentials are write-only in API responses and never logged.
+1. **Transient Errors (HTTP 500-504)**: Retried up to 3 times with exponential backoff:
+   $$T_{\text{sleep}} = 0.5 \times 2^{\text{attempt}}\text{ seconds}$$
+2. **Rate Limiting (HTTP 429)**: The client inspects the `Retry-After` header. If within threshold, it sleeps and retries. If exhausted, it raises `MauzoPilotRateLimitError`.
+3. **Correlation Tracking**: Every request carries an `X-Correlation-ID` header, which is preserved in `IntegrationSyncLog` and transactional outbox payloads.
+4. **Failure Logging**: Any failure increments `MauzoPilotConfig.consecutive_failure_count` and updates `last_sync_error`.
 
 ---
 
-## 3. Configuration & Activating the Live Connector
+## 5. API Endpoints in AVESTELLAR FINANCE
 
-By default, the live MauzoPilot connector is **intentionally disabled (`is_active = False`)** to protect ledger integrity until genuine API credentials and base URLs are provisioned.
-
-### 3.1 Step 1: Configure Environment Variables
-In `.env`:
-```ini
-MAUZOPILOT_ENABLED=True
-MAUZOPILOT_BASE_URL=https://api.mauzopilot.com/v1
-MAUZOPILOT_API_KEY=mp_live_your_actual_api_key_here
-MAUZOPILOT_WEBHOOK_SECRET=mp_whsec_your_actual_webhook_secret_here
-```
-
-### 3.2 Step 2: Configure Organization Connector via REST API
-```bash
-PATCH /api/v1/integrations/mauzopilot/config/
+### 5.1 Trigger Incremental Sync
+```http
+POST /api/v1/integrations/mauzopilot/sync/
 Headers:
   Authorization: Bearer <JWT_ACCESS_TOKEN>
   X-Organization-ID: <ORGANIZATION_UUID>
-  Content-Type: application/json
 
-Body:
+Response (200 OK):
 {
-  "base_url": "https://api.mauzopilot.com/v1",
-  "api_key": "mp_live_your_actual_api_key_here",
-  "webhook_secret": "mp_whsec_your_actual_webhook_secret_here",
-  "is_active": true,
-  "sync_customers": true,
-  "sync_sales": true,
-  "sync_payments": true,
-  "request_timeout": 15
+  "organization_id": "113df537-e604-4f81-98e7-23131f7c1243",
+  "started_at": "2026-10-27T06:37:27.949785Z",
+  "finished_at": "2026-10-27T06:37:28.115432Z",
+  "customers_retrieved": 12,
+  "customers_created": 3,
+  "customers_updated": 9,
+  "customers_skipped": 0,
+  "sales_retrieved": 45,
+  "invoices_created": 45,
+  "invoices_settled": 42,
+  "sales_skipped": 0,
+  "duplicates_detected": 0,
+  "validation_failures": 0,
+  "request_failures": 0,
+  "status": "SUCCESS"
 }
 ```
 
-### 3.3 Step 3: Run Endpoint Health Check
-```bash
+### 5.2 Test Connectivity
+```http
 POST /api/v1/integrations/mauzopilot/test-connection/
 Headers:
   Authorization: Bearer <JWT_ACCESS_TOKEN>
   X-Organization-ID: <ORGANIZATION_UUID>
 
-Response:
+Response (200 OK):
 {
   "status": "CONNECTED",
   "status_code": 200,
   "connected": true,
-  "base_url": "https://api.mauzopilot.com/v1"
+  "latency_ms": 42.15,
+  "base_url": "https://api.mauzopilot.com",
+  "business_id": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
 }
 ```
-
----
-
-## 4. Canonical Object Mappings
-
-| MauzoPilot Object | AVESTELLAR FINANCE Object | Mapping Invariant |
-| :--- | :--- | :--- |
-| Customer (`id`) | `invoicing.Customer` | Unique mapping in `integrations_external_mappings`. Duplicate requests resolve to the existing Customer. |
-| Sales Order (`id`) | `invoicing.Invoice` | Creates a `DRAFT` invoice. Computes VAT/tax. Ledger receivable is not posted until formally issued. |
-| Payment Collection (`id`) | `payments.Payment` | Settles matching invoice, transitions invoice to `PARTIALLY_PAID` or `PAID`, posts Dr Cash/Cr AR entry atomically. |

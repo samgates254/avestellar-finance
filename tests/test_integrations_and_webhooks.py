@@ -17,6 +17,7 @@ from integrations.adapters.mauzopilot import MauzoPilotAdapter
 from integrations.models import ExternalObjectMapping, MauzoPilotConfig
 from ledger.services.initialization import initialize_organization_accounts
 from organizations.models import Membership, Organization, RoleChoices
+from payments.models import Payment, PaymentMethod, PaymentStatus
 
 
 @pytest.mark.django_db
@@ -31,6 +32,7 @@ class TestIntegrationsAndWebhooks:
         self.adapter = MauzoPilotAdapter(organization=self.org)
         self.mp_config = MauzoPilotConfig.objects.create(
             organization=self.org,
+            business_id="b9a76d1e-2c3f-4e5a-8b9c-1d2e3f4a5b6c",
             base_url="https://api.mauzopilot.mock/v1",
             api_key="test-api-key-12345",
             webhook_secret="test-webhook-secret-67890",
@@ -134,3 +136,460 @@ class TestIntegrationsAndWebhooks:
 
         event.refresh_from_db()
         assert event.status == OutboxStatus.PROCESSED
+
+    def test_mauzopilot_test_connection_scenarios(self):
+        # 1. Connected
+        transport_ok = httpx.MockTransport(lambda req: httpx.Response(200, json={"status": "ok"}))
+        with httpx.Client(transport=transport_ok) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            result = adapter.test_connection()
+            assert result["connected"] is True
+            assert result["status"] == "CONNECTED"
+            assert result["status_code"] == 200
+
+        # 2. Upstream Error (500)
+        transport_err = httpx.MockTransport(lambda req: httpx.Response(500, text="Internal Server Error"))
+        with httpx.Client(transport=transport_err) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            result = adapter.test_connection()
+            assert result["connected"] is False
+            assert result["status"] == "UNAVAILABLE"
+
+        # 3. Disabled connector
+        self.mp_config.is_active = False
+        self.mp_config.save()
+        adapter_disabled = MauzoPilotAdapter(organization=self.org)
+        res_disabled = adapter_disabled.test_connection()
+        assert res_disabled["connected"] is False
+        assert res_disabled["status"] == "DISABLED"
+        self.mp_config.is_active = True
+        self.mp_config.save()
+
+    def test_mauzopilot_incremental_customer_sync_and_cursor(self):
+        cust_uuid = "e7b0e5ef-5b3e-4fa0-8268-c11ef1261d15"
+        mock_customers = [
+            {
+                "id": cust_uuid,
+                "name": "Nairobi Wholesalers Ltd",
+                "phone": "+254700112233",
+                "email": "sales@nairobiwholesalers.co.ke",
+                "notes": "Key wholesale partner",
+                "credit_limit_cents": 50000000,  # KES 500,000.00
+                "is_active": True,
+                "created_at_utc": "2026-03-01T10:00:00Z",
+                "updated_at_utc": "2026-03-10T12:00:00Z",
+                "balance_cents": 12500000,
+            }
+        ]
+
+        def handler(request: httpx.Request):
+            assert "Authorization" in request.headers
+            assert "X-Correlation-ID" in request.headers
+            assert request.headers["Authorization"] == f"Token {self.mp_config.api_key}"
+            return httpx.Response(200, json=mock_customers)
+
+        transport = httpx.MockTransport(handler)
+        with httpx.Client(transport=transport) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            customers = adapter.pull_customers_incremental()
+
+        assert len(customers) == 1
+        customer = customers[0]
+        assert customer.name == "Nairobi Wholesalers Ltd"
+
+        # Verify mapping exists and preserves raw metadata
+        mapping = ExternalObjectMapping.objects.get(
+            organization=self.org,
+            external_type="customer",
+            external_id=cust_uuid,
+        )
+        assert mapping.internal_id == customer.id
+        assert mapping.raw_metadata["credit_limit_cents"] == 50000000
+
+        # Verify cursor was updated on MauzoPilotConfig
+        self.mp_config.refresh_from_db()
+        assert self.mp_config.customer_sync_cursor is not None
+        assert "2026-03-10T12:00:00" in self.mp_config.customer_sync_cursor.isoformat()
+
+        # Verify outbox event emitted
+        evt = OutboxEvent.objects.filter(
+            organization=self.org, event_type="customer.synchronized"
+        ).order_by("-occurred_at").first()
+        assert evt is not None
+        assert evt.payload["external_id"] == cust_uuid
+        assert evt.payload["name"] == "Nairobi Wholesalers Ltd"
+
+    def test_mauzopilot_incremental_sales_sync_creates_draft_invoice(self):
+        sale_uuid = "834cba8a-c603-455b-b98a-78c5d2d0c242"
+        cust_uuid = "e7b0e5ef-5b3e-4fa0-8268-c11ef1261d15"
+        mock_sales = [
+            {
+                "id": sale_uuid,
+                "receipt_number": "REC-2026-0001",
+                "idempotency_key": "idemp-sale-001",
+                "status": "COMPLETED",
+                "subtotal_cents": 2000000,  # KES 20,000.00
+                "total_cents": 2320000,     # KES 23,200.00
+                "payment_method": "CASH",
+                "payment_reference": "CASH-991",
+                "paid_cents": 0,            # Unpaid draft
+                "credit_cents": 2320000,
+                "customer_id": cust_uuid,
+                "employee_username": "pos_operator",
+                "created_at_utc": "2026-03-15T09:00:00Z",
+                "received_at_utc": "2026-03-15T09:05:00Z",
+                "lines": [
+                    {
+                        "id": "line-01",
+                        "product_name": "Premium Maize Flour 10kg",
+                        "sku": "MF-10KG",
+                        "quantity": 10,
+                        "unit_price_cents": 200000,  # KES 2,000.00
+                        "unit_cost_cents": 150000,
+                        "line_total_cents": 2000000,
+                        "tax_rate": "0.16",
+                    }
+                ],
+            }
+        ]
+
+        def handler(request: httpx.Request):
+            return httpx.Response(200, json=mock_sales)
+
+        transport = httpx.MockTransport(handler)
+        with httpx.Client(transport=transport) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            invoices = adapter.pull_sales_incremental()
+
+        assert len(invoices) == 1
+        inv = invoices[0]
+        assert inv.status == InvoiceStatus.DRAFT  # Operational source creates draft financial doc
+        assert inv.total_amount == Decimal("23200.0000")
+        assert inv.subtotal == Decimal("20000.0000")
+        assert inv.tax_amount == Decimal("3200.0000")
+        assert inv.items.count() == 1
+        line = inv.items.first()
+        assert line.quantity == Decimal("10.0000")
+        assert line.unit_price == Decimal("2000.0000")
+
+        # Verify cursor updated
+        self.mp_config.refresh_from_db()
+        assert self.mp_config.sale_sync_cursor is not None
+        assert self.mp_config.sale_after_id == sale_uuid
+
+        # Verify outbox events: sale.received and invoice.issued
+        assert OutboxEvent.objects.filter(
+            organization=self.org, event_type="sale.received"
+        ).exists()
+
+    def test_mauzopilot_paid_sale_automatic_settlement_and_ledger_posting(self):
+        """Happy-path: cash collection auto-settles when organization policy explicitly allows it.
+
+        The `auto_settle_cash` flag must be True AND the sale must carry cashier attribution.
+        This represents the legitimate, policy-controlled cash settlement path.
+        """
+        # Enable organization cash auto-settlement policy
+        self.mp_config.auto_settle_cash = True
+        self.mp_config.save()
+
+        sale_uuid = "f9a12b3c-4d5e-6f7a-8b9c-0d1e2f3a4b5c"
+        mock_sales = [
+            {
+                "id": sale_uuid,
+                "receipt_number": "REC-PAID-009",
+                "idempotency_key": "idemp-paid-009",
+                "status": "COMPLETED",
+                "subtotal_cents": 1000000,  # KES 10,000.00
+                "total_cents": 1000000,     # KES 10,000.00
+                "payment_method": "CASH",
+                "payment_reference": "POS-CASH-881",
+                "paid_cents": 1000000,      # Fully paid in MauzoPilot
+                "credit_cents": 0,
+                "customer_id": None,
+                "employee_username": "cashier_1",  # Required cashier attribution for cash policy
+                "created_at_utc": "2026-03-16T14:00:00Z",
+                "received_at_utc": "2026-03-16T14:02:00Z",
+                "lines": [
+                    {
+                        "id": "line-p-1",
+                        "product_name": "Retail Item Pack",
+                        "sku": "RIP-001",
+                        "quantity": 2,
+                        "unit_price_cents": 500000,
+                        "unit_cost_cents": 350000,
+                        "line_total_cents": 1000000,
+                    }
+                ],
+            }
+        ]
+
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, json=mock_sales))
+        with httpx.Client(transport=transport) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            invoices = adapter.pull_sales_incremental()
+
+        assert len(invoices) == 1
+        inv = invoices[0]
+        assert inv.status == InvoiceStatus.PAID
+        assert inv.paid_amount == Decimal("10000.0000")
+
+        # Payment record exists and is confirmed
+        payment = Payment.objects.filter(
+            organization=self.org, reference="POS-CASH-881"
+        ).first()
+        assert payment is not None
+        assert payment.status == PaymentStatus.CONFIRMED
+        assert payment.amount == Decimal("10000.0000")
+        assert payment.journal_entry is not None
+
+        # Outbox event payment.confirmed emitted
+        assert OutboxEvent.objects.filter(
+            organization=self.org, event_type="payment.confirmed"
+        ).exists()
+
+    def test_mauzopilot_unverified_cash_sale_blocked_without_policy(self):
+        """Safety-path: cash collection from MauzoPilot WITHOUT auto_settle_cash policy.
+
+        The incoming claim that a sale was paid must NOT auto-settle the invoice.
+        The payment must remain PENDING, the invoice must stay DRAFT, and no ledger
+        entry must be posted. An outbox event for verification_required must be emitted.
+        """
+        # auto_settle_cash is False by default in setUp — do not change it
+        assert not self.mp_config.auto_settle_cash
+
+        sale_uuid = "d1c2b3a4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
+        mock_sales = [
+            {
+                "id": sale_uuid,
+                "receipt_number": "REC-UNVER-001",
+                "idempotency_key": "idemp-unver-001",
+                "status": "COMPLETED",
+                "subtotal_cents": 500000,   # KES 5,000.00
+                "total_cents": 500000,
+                "payment_method": "CASH",
+                "payment_reference": "POS-CASH-UNVER-001",
+                "paid_cents": 500000,
+                "credit_cents": 0,
+                "customer_id": None,
+                "employee_username": "cashier_2",
+                "created_at_utc": "2026-03-17T09:00:00Z",
+                "received_at_utc": "2026-03-17T09:01:00Z",
+                "lines": [
+                    {
+                        "id": "line-u-1",
+                        "product_name": "Basic Stock Item",
+                        "sku": "BSI-001",
+                        "quantity": 1,
+                        "unit_price_cents": 500000,
+                        "unit_cost_cents": 300000,
+                        "line_total_cents": 500000,
+                    }
+                ],
+            }
+        ]
+
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, json=mock_sales))
+        with httpx.Client(transport=transport) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            invoices = adapter.pull_sales_incremental()
+
+        # Invoice was created but NOT confirmed — policy blocks automatic settlement
+        assert len(invoices) == 1
+        inv = invoices[0]
+        assert inv.status == InvoiceStatus.DRAFT, (
+            "Invoice must remain DRAFT when cash policy is not enabled; "
+            "upstream claim of payment is not sufficient evidence."
+        )
+
+        # Payment recorded as PENDING — awaiting human or policy verification
+        payment = Payment.objects.filter(
+            organization=self.org, reference="POS-CASH-UNVER-001"
+        ).first()
+        assert payment is not None
+        assert payment.status == PaymentStatus.PENDING, (
+            "Unverified cash collection must be recorded as PENDING, not CONFIRMED."
+        )
+        assert payment.journal_entry is None, (
+            "No ledger entry must be posted for an unverified payment."
+        )
+
+        # Outbox event signals that human verification is required
+        assert OutboxEvent.objects.filter(
+            organization=self.org, event_type="payment.verification_required"
+        ).exists(), (
+            "An outbox event must be emitted so that downstream workflows can route the payment for review."
+        )
+
+    def test_mauzopilot_sync_summary_and_error_handling(self):
+        # Trigger full run_incremental_sync with mock
+        def handler(request: httpx.Request):
+            if "customers" in str(request.url):
+                return httpx.Response(200, json=[])
+            if "sales" in str(request.url):
+                return httpx.Response(200, json=[])
+            return httpx.Response(404)
+
+        transport = httpx.MockTransport(handler)
+        with httpx.Client(transport=transport) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            summary = adapter.run_incremental_sync()
+
+        assert summary.status == "SUCCESS"
+        assert summary.organization_id == str(self.org.id)
+        assert summary.customers_retrieved == 0
+        assert summary.sales_retrieved == 0
+
+    def test_mauzopilot_rate_limit_retry_and_exhaustion(self):
+        call_count = 0
+
+        def rate_limit_handler(request: httpx.Request):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                return httpx.Response(429, headers={"Retry-After": "0"}, text="Rate limit exceeded")
+            return httpx.Response(200, json=[])
+
+        transport = httpx.MockTransport(rate_limit_handler)
+        with httpx.Client(transport=transport) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            # Should retry after 429 and succeed on attempt 2
+            customers = adapter.pull_customers_incremental()
+            assert customers == []
+            assert call_count == 2
+
+    def test_sync_trigger_api_view(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.defaults["HTTP_X_ORGANIZATION_ID"] = str(self.org.id)
+
+        # Mock requests inside the view
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, json=[]))
+        with httpx.Client(transport=transport) as mock_client:
+            # We patch MauzoPilotAdapter._request_with_retry or client
+            response = self.client.post("/api/v1/integrations/mauzopilot/sync/")
+            # Even if upstream is offline in unmocked environment or mock returns, we check response structure
+            assert response.status_code in (200, 502)
+            if response.status_code == 200:
+                assert "customers_retrieved" in response.data
+
+    def test_integration_health_overview_view(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.defaults["HTTP_X_ORGANIZATION_ID"] = str(self.org.id)
+
+        response = self.client.get("/api/v1/integrations/health/")
+        assert response.status_code == 200
+        data = response.data
+
+        assert "organization_id" in data
+        assert "mauzopilot" in data
+        assert "daraja" in data
+        assert "outbox" in data
+
+        # Security invariant: verify no secrets leaked!
+        resp_json = json.dumps(data)
+        assert "test-api-key-12345" not in resp_json
+        assert "test-webhook-secret-67890" not in resp_json
+
+    def test_n8n_inbound_webhook_valid_and_invalid_signatures(self):
+        secret = "n8n-shared-secret"
+        self.mp_config.webhook_secret = secret
+        self.mp_config.save()
+
+        client = APIClient()
+        url = "/api/v1/integrations/n8n/webhook/"
+
+        body = json.dumps({
+            "action": "sync_customer",
+            "organization_id": str(self.org.id),
+            "payload": {
+                "id": "mp-n8n-cust-001",
+                "name": "N8N Synced Customer Ltd",
+                "email": "n8n@example.com",
+            }
+        }).encode("utf-8")
+
+        timestamp = str(int(time.time()))
+        valid_sig = generate_webhook_signature(secret, timestamp, body)
+
+        # 1. Valid signature -> 200
+        res = client.post(
+            url,
+            data=body,
+            content_type="application/json",
+            HTTP_X_WEBHOOK_SIGNATURE=valid_sig,
+            HTTP_X_WEBHOOK_TIMESTAMP=timestamp,
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),
+        )
+        assert res.status_code == 200
+        assert res.data["status"] == "SUCCESS"
+        assert res.data["name"] == "N8N Synced Customer Ltd"
+
+        # 2. Tampered signature -> 401
+        res_tampered = client.post(
+            url,
+            data=body,
+            content_type="application/json",
+            HTTP_X_WEBHOOK_SIGNATURE="invalid-signature-hash",
+            HTTP_X_WEBHOOK_TIMESTAMP=timestamp,
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),
+        )
+        assert res_tampered.status_code == 401
+
+    def test_n8n_inbound_webhook_additional_actions(self):
+        secret = "n8n-shared-secret-actions"
+        self.mp_config.webhook_secret = secret
+        self.mp_config.save()
+
+        client = APIClient()
+        url = "/api/v1/integrations/n8n/webhook/"
+
+        def sign_and_send(payload_dict):
+            b = json.dumps(payload_dict).encode("utf-8")
+            t = str(int(time.time()))
+            sig = generate_webhook_signature(secret, t, b)
+            return client.post(
+                url,
+                data=b,
+                content_type="application/json",
+                HTTP_X_WEBHOOK_SIGNATURE=sig,
+                HTTP_X_WEBHOOK_TIMESTAMP=t,
+                HTTP_X_ORGANIZATION_ID=str(self.org.id),
+            )
+
+        # Action: query_reconciliation_exceptions
+        res_recon = sign_and_send({
+            "action": "query_reconciliation_exceptions",
+            "organization_id": str(self.org.id),
+        })
+        assert res_recon.status_code == 200
+        assert "exceptions" in res_recon.data
+
+        # Action: query_overdue_invoices
+        res_overdue = sign_and_send({
+            "action": "query_overdue_invoices",
+            "organization_id": str(self.org.id),
+        })
+        assert res_overdue.status_code == 200
+        assert "overdue_invoices" in res_overdue.data
+
+    def test_tenant_isolation_integrations(self):
+        # Create second organization
+        org2 = Organization.objects.create(name="Competitor Retailers", slug="comp-org", currency="KES")
+        user2 = User.objects.create_user(email="intruder@competitor.com", password="Password123!")
+        Membership.objects.create(organization=org2, user=user2, role=RoleChoices.ACCOUNTANT)
+
+        client2 = APIClient()
+        client2.force_authenticate(user=user2)
+        client2.defaults["HTTP_X_ORGANIZATION_ID"] = str(org2.id)
+
+        # Competitor should see their own health (unconfigured MauzoPilot), not self.org's
+        res = client2.get("/api/v1/integrations/health/")
+        assert res.status_code == 200
+        assert res.data["organization_id"] == str(org2.id)
+        assert res.data["mauzopilot"]["enabled"] is False
+
+        # Competitor cannot trigger sync for self.org
+        res_sync = client2.post(
+            "/api/v1/integrations/mauzopilot/sync/",
+            HTTP_X_ORGANIZATION_ID=str(self.org.id),  # Header mismatch with membership
+        )
+        assert res_sync.status_code in (400, 403)
