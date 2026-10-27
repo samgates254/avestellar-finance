@@ -1,0 +1,4 @@
+Date,Reference,Description,Debit,Credit
+2026-01-05,E2E-DEP-001,Synthetic customer deposit,0.00,1500.00
+2026-01-07,E2E-WDL-002,Synthetic vendor payment,400.00,0.00
+2026-01-09,E2E-DEP-003,Synthetic refund received,0.00,250.00
