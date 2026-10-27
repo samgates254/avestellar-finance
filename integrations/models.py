@@ -11,7 +11,7 @@ class MauzoPilotConfig(models.Model):
         on_delete=models.CASCADE,
         related_name="mauzopilot_config",
     )
-    base_url = models.URLField(default="https://api.mauzopilot.com/v1")
+    base_url = models.URLField(default="https://api.mauzopilot.com")
     business_id = models.CharField(max_length=64, blank=True)
     api_key = models.CharField(max_length=255, blank=True)
     webhook_secret = models.CharField(max_length=255, blank=True)

@@ -35,7 +35,7 @@ class TestCanonicalDataFlywheel:
         self.mp_config = MauzoPilotConfig.objects.create(
             organization=self.org,
             business_id="a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-            base_url="https://api.mauzopilot.mock/v1",
+            base_url="https://api.mauzopilot.mock",
             api_key="mp-live-key-xyz",
             webhook_secret="mp-secret-flywheel",
             is_active=True,
@@ -247,7 +247,10 @@ class TestCanonicalDataFlywheel:
         assert deliveries[0].status_code == 500
 
         event.refresh_from_db()
-        assert event.status == OutboxStatus.PROCESSED
+        assert event.status == OutboxStatus.FAILED
+        assert event.processed_at is None
+        assert event.attempts == 1
+        assert deliveries[0].next_retry_at is not None
         assert deliveries[0].status == DeliveryStatus.FAILED
 
         # 2. Redelivery attempt succeeds (HTTP 200)
@@ -257,6 +260,10 @@ class TestCanonicalDataFlywheel:
 
         assert len(deliveries_retry) == 1
         assert deliveries_retry[0].status == DeliveryStatus.SUCCESS
+        event.refresh_from_db()
+        assert event.status == OutboxStatus.PROCESSED
+        assert event.processed_at is not None
+        assert event.attempts == 2
 
         # Total deliveries is now 2 (1 failed, 1 succeeded)
         assert WebhookDelivery.objects.filter(outbox_event=event).count() == 2

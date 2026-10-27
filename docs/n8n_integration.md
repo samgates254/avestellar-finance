@@ -9,9 +9,36 @@ This guide details how **n8n** automation workflows interact with **AVESTELLAR F
 1. **Zero Direct Database Access**: All actions must pass through AVESTELLAR FINANCE's domain services via `/api/v1/` REST endpoints or the `/api/v1/integrations/n8n/webhook/` endpoint.
 2. **Tenant Isolation**: Every inbound request must provide an active `X-Organization-ID` header matching the authorized token context or signed organization. Cross-organization access is rejected.
 3. **Double-Entry Integrity**: External workflow engines cannot directly post journal lines. Workflows interact through business operations (`issue_invoice`, `record_and_confirm_customer_payment`), ensuring every posted transaction is balanced ($\sum \text{Dr} = \sum \text{Cr}$).
-4. **HMAC Signature Verification & Replay Protection**:
+4. **n8n HMAC Signature Verification & Replay Protection**:
    - Outbound and inbound payloads are signed using HMAC-SHA256 over `${timestamp}.${raw_body}`.
    - Timestamps older than 300 seconds are rejected immediately.
+
+### Verified MauzoPilot API and event contract
+
+The current MauzoPilot backend exposes `GET /api/health/` (liveness only),
+`GET /api/businesses/{business_id}/customers/`, and
+`GET /api/businesses/{business_id}/sales/`. The business-scoped routes require
+an active membership and accept `Authorization: Token <key>` (also `Bearer`).
+Customer and sale downloads are JSON lists, not a paginated `results` envelope.
+Customer downloads accept `updated_since`; sales are ordered by
+`received_at_utc` and ID, return at most 500 records, and accept the stable
+`received_since` plus `after_id` cursor. Sale prices, totals, and payments are
+integer KES cents. Sales include both line snapshots and normalized `items`;
+the currently configured MauzoPilot accounting rules require total to equal
+subtotal and do not apply tax or discounts. The sale payload does not carry a
+currency field; AVESTELLAR interprets cents in the configured organization
+currency, which must therefore be KES for this connector.
+
+MauzoPilot's outbound webhook signs the exact compact JSON request body with
+HMAC-SHA256 (hex digest, sent as `sha256=<digest>` in
+`X-Mauzopilot-Signature`). `X-Mauzopilot-Timestamp` is an ISO-8601 timestamp;
+`X-Organization-ID` carries the MauzoPilot business UUID. This differs from
+the n8n action endpoint's timestamp-prefixed signature. Direct MauzoPilot
+events must use `POST /api/v1/integrations/mauzopilot/events/`, which verifies
+the MauzoPilot contract and resolves the AVESTELLAR organization through its
+configured MauzoPilot business ID. Both endpoints require a non-empty shared
+webhook secret. Duplicate customer/sale/payment effects are handled by the
+existing external mappings and payment idempotency keys.
 
 ---
 
@@ -80,6 +107,28 @@ This guide details how **n8n** automation workflows interact with **AVESTELLAR F
   1. n8n queries `/api/v1/analytics/working-capital/` and `/api/v1/analytics/cash-flow/`.
   2. Evaluates Altman Z-Score and Quick Ratio against organization safety thresholds.
   3. If working capital drops below threshold or runway $< 60$ days, formats an Executive Briefing PDF and delivers it to the CFO.
+
+Workflow action `confirm_payment` is a request to evaluate a reported
+collection, not authority to bypass verification. The payment service can
+return a pending-verification result; settlement requires the configured
+provider evidence, cleared statement match, or an authorized manual/cash
+policy.
+
+### Workflow F: Payment verification exceptions and successful settlement
+
+- Subscribe the n8n Webhook node to the AVESTELLAR outbox notification URL.
+- Route `payment.verification_required` to an exception queue and alert the
+  finance operator with the reference, amount, invoice ID, and correlation ID.
+- Route `payment.confirmed` to the successful-payment notification flow only
+  after AVESTELLAR commits the balanced journal and outbox event.
+- Treat deliveries as at least once; use `event_id` and `idempotency_key` to
+  deduplicate downstream notifications.
+
+Configure these workflows with AVESTELLAR's authorized organization-scoped
+API token and the shared webhook secret stored in n8n credentials. Keep all
+financial writes behind AVESTELLAR APIs and services. No live n8n instance was
+available in the local environment, so these are configuration examples and
+were not executed against n8n.
 
 ---
 

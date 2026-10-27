@@ -1,7 +1,11 @@
+import hashlib
+import hmac
+
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
@@ -19,6 +23,90 @@ from organizations.permissions import (
     IsOrganizationMember,
     get_request_organization,
 )
+
+
+def _verify_mauzopilot_event_signature(secret: str, timestamp: str, body: bytes, signature: str) -> bool:
+    """Verify MauzoPilot's raw-body HMAC and ISO timestamp contract."""
+    try:
+        parsed = parse_datetime(timestamp)
+        if parsed is None or timezone.is_naive(parsed):
+            return False
+        if abs((timezone.now() - parsed).total_seconds()) > 300:
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+    provided = signature.removeprefix("sha256=").strip().lower()
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return bool(provided) and hmac.compare_digest(expected, provided)
+
+
+class MauzoPilotEventWebhookView(APIView):
+    """Receive the signed event envelope sent by MauzoPilot's webhook service."""
+
+    permission_classes = (permissions.AllowAny,)
+
+    @extend_schema(
+        request=OpenApiTypes.OBJECT,
+        responses={
+            200: OpenApiTypes.OBJECT,
+            400: OpenApiTypes.OBJECT,
+            401: OpenApiTypes.OBJECT,
+            404: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
+        },
+    )
+    def post(self, request):
+        business_id = request.headers.get("X-Organization-ID", "")
+        cfg = MauzoPilotConfig.objects.filter(business_id=business_id).select_related("organization").first()
+        if not cfg or not cfg.organization.is_active:
+            return Response({"detail": "MauzoPilot business is not configured."}, status=status.HTTP_404_NOT_FOUND)
+        if not cfg.webhook_secret:
+            return Response({"detail": "MauzoPilot webhook secret is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        signature = request.headers.get("X-Mauzopilot-Signature", "")
+        timestamp = request.headers.get("X-Mauzopilot-Timestamp", "")
+        if not _verify_mauzopilot_event_signature(cfg.webhook_secret, timestamp, request.body, signature):
+            return Response({"detail": "Invalid or expired MauzoPilot signature."}, status=status.HTTP_401_UNAUTHORIZED)
+
+        event = request.data
+        if event.get("business_id") != business_id or not event.get("event_id"):
+            return Response({"detail": "MauzoPilot event identity does not match its signed business."}, status=status.HTTP_400_BAD_REQUEST)
+        if event.get("schema_version") != "1.0":
+            return Response({"detail": "Unsupported MauzoPilot event schema version."}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return Response({"detail": "MauzoPilot event data must be an object."}, status=status.HTTP_400_BAD_REQUEST)
+
+        adapter = MauzoPilotAdapter(organization=cfg.organization)
+        event_type = event.get("event_type")
+        try:
+            if event_type in {"customer.created", "customer.updated"}:
+                customer = adapter.sync_customer(data)
+                result = {"customer_id": str(customer.id)}
+            elif event_type == "sale.completed":
+                invoice = adapter.sync_sales_order_to_draft_invoice(data)
+                result = {"invoice_id": str(invoice.id)}
+                paid_cents = int(data.get("paid_cents", 0))
+                if paid_cents > 0:
+                    payment = adapter.sync_payment_collection(
+                        {
+                            "id": f"pay-{data['id']}",
+                            "order_id": data["id"],
+                            "paid_cents": paid_cents,
+                            "payment_reference": data.get("payment_reference") or data.get("receipt_number", ""),
+                            "payment_method": data.get("payment_method", "MPESA"),
+                        }
+                    )
+                    result["payment_id"] = str(payment.id)
+                    result["payment_status"] = payment.status
+            else:
+                return Response({"detail": f"Unsupported MauzoPilot event '{event_type}'."}, status=status.HTTP_400_BAD_REQUEST)
+        except (KeyError, TypeError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"status": "SUCCESS", "event_id": event["event_id"], **result})
 
 
 @extend_schema_view(
@@ -193,17 +281,18 @@ class N8nInboundWebhookView(APIView):
             return Response({"detail": "Organization not found."}, status=status.HTTP_404_NOT_FOUND)
 
         cfg = MauzoPilotConfig.objects.filter(organization=org).first()
-        if cfg and cfg.webhook_secret:
-            sig = (
-                request.headers.get("X-Avestellar-Signature")
-                or request.headers.get("X-Webhook-Signature", "")
-            )
-            ts = (
-                request.headers.get("X-Avestellar-Timestamp")
-                or request.headers.get("X-Webhook-Timestamp", "")
-            )
-            if not sig or not ts or not verify_webhook_signature(cfg.webhook_secret, ts, request.body, sig):
-                return Response({"detail": "Invalid or expired webhook signature."}, status=status.HTTP_401_UNAUTHORIZED)
+        if not cfg or not cfg.webhook_secret:
+            return Response({"detail": "Webhook secret is not configured."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        sig = (
+            request.headers.get("X-Avestellar-Signature")
+            or request.headers.get("X-Webhook-Signature", "")
+        )
+        ts = (
+            request.headers.get("X-Avestellar-Timestamp")
+            or request.headers.get("X-Webhook-Timestamp", "")
+        )
+        if not sig or not ts or not verify_webhook_signature(cfg.webhook_secret, ts, request.body, sig):
+            return Response({"detail": "Invalid or expired webhook signature."}, status=status.HTTP_401_UNAUTHORIZED)
 
         action = request.data.get("action")
         payload = request.data.get("payload", {})

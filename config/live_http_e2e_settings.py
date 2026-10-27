@@ -1,0 +1,21 @@
+"""Settings overlay restricted to a dedicated disposable local PostgreSQL DB."""
+
+import os
+
+from django.core.exceptions import ImproperlyConfigured
+
+from config.settings import *  # noqa: F403
+
+test_database = os.environ.get("E2E_AV_DATABASE_NAME", "")
+if DATABASES["default"]["ENGINE"] != "django.db.backends.postgresql":  # noqa: F405
+    raise ImproperlyConfigured("The live HTTP fixture requires PostgreSQL.")
+if not test_database.startswith("avestellar_live_http_"):
+    raise ImproperlyConfigured(
+        "E2E_AV_DATABASE_NAME must use the avestellar_live_http_* disposable prefix."
+    )
+
+DATABASES["default"]["NAME"] = test_database  # noqa: F405
+DATABASES["default"]["CONN_MAX_AGE"] = 0  # noqa: F405
+DEBUG = True
+ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+SECRET_KEY = "synthetic-local-http-integration-only"

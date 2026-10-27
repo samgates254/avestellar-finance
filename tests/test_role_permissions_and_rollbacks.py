@@ -4,7 +4,13 @@ import pytest
 from django.core.management import call_command
 from rest_framework.test import APIClient
 
-from automation.models import OutboxEvent, OutboxStatus
+from automation.models import (
+    DeliveryStatus,
+    OutboxEvent,
+    OutboxStatus,
+    WebhookDelivery,
+    WebhookSubscription,
+)
 from identity.models import User
 from invoicing.models import Customer, Invoice, InvoiceLineItem, InvoiceStatus
 from invoicing.services import issue_invoice
@@ -103,3 +109,34 @@ class TestRolePermissionsAndRollbacks:
         call_command("process_outbox")
         evt = OutboxEvent.objects.get(event_id="evt-cmd-001")
         assert evt.status == OutboxStatus.PROCESSED
+
+    def test_process_outbox_command_retries_due_failed_events(self):
+        sub = WebhookSubscription.objects.create(
+            organization=self.org,
+            target_url="http://127.0.0.1:1/test",
+            secret="synthetic-secret",
+            events=["test.event"],
+            is_active=True,
+        )
+        event = OutboxEvent.objects.create(
+            event_id="evt-cmd-retry-001",
+            event_type="test.event",
+            organization=self.org,
+            # Legacy dispatcher versions marked failed deliveries processed.
+            status=OutboxStatus.PROCESSED,
+            payload={"msg": "retry me"},
+        )
+        WebhookDelivery.objects.create(
+            subscription=sub,
+            outbox_event=event,
+            status=DeliveryStatus.FAILED,
+            attempts=1,
+            next_retry_at=None,
+        )
+
+        with patch(
+            "automation.management.commands.process_outbox.dispatch_outbox_event"
+        ) as dispatch:
+            call_command("process_outbox", "--limit", "10")
+
+        assert any(call.args[0].id == event.id for call in dispatch.call_args_list)

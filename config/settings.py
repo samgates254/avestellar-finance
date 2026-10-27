@@ -184,7 +184,7 @@ DEFAULT_DECIMAL_PLACES = env("DEFAULT_DECIMAL_PLACES")
 
 # MauzoPilot Connector Configuration
 MAUZOPILOT_ENABLED = env("MAUZOPILOT_ENABLED")
-MAUZOPILOT_BASE_URL = env.str("MAUZOPILOT_BASE_URL", default="https://api.mauzopilot.com/v1")
+MAUZOPILOT_BASE_URL = env.str("MAUZOPILOT_BASE_URL", default="https://api.mauzopilot.com")
 MAUZOPILOT_API_KEY = env.str("MAUZOPILOT_API_KEY", default="")
 MAUZOPILOT_WEBHOOK_SECRET = env.str("MAUZOPILOT_WEBHOOK_SECRET", default="")
 

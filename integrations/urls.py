@@ -7,6 +7,7 @@ from integrations.views import (
     DarajaVerifyTransactionStatusView,
     IntegrationHealthOverviewView,
     MauzoPilotConfigView,
+    MauzoPilotEventWebhookView,
     MauzoPilotMappingListView,
     MauzoPilotSyncTriggerView,
     MauzoPilotTestConnectionView,
@@ -19,6 +20,7 @@ urlpatterns = [
     path("integrations/mauzopilot/test-connection/", MauzoPilotTestConnectionView.as_view(), name="mauzopilot-test-connection"),
     path("integrations/mauzopilot/sync/", MauzoPilotSyncTriggerView.as_view(), name="mauzopilot-sync-trigger"),
     path("integrations/mauzopilot/mappings/", MauzoPilotMappingListView.as_view(), name="mauzopilot-mappings"),
+    path("integrations/mauzopilot/events/", MauzoPilotEventWebhookView.as_view(), name="mauzopilot-events"),
 
     # Integration Health and Telemetry
     path("integrations/health/", IntegrationHealthOverviewView.as_view(), name="integration-health-overview"),

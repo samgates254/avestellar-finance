@@ -183,7 +183,7 @@ class MauzoPilotAdapter:
         raise MauzoPilotAPIError(f"MauzoPilot request failed after {self.MAX_RETRIES} attempts: {str(last_exc)}")
 
     def test_connection(self) -> dict[str, Any]:
-        """Validates upstream endpoint connectivity, timeouts, and auth header format."""
+        """Check public liveness plus authenticated access to the configured business."""
         if not self.config:
             return {
                 "status": "UNCONFIGURED",
@@ -204,11 +204,16 @@ class MauzoPilotAdapter:
                 "message": "MauzoPilot API key is required.",
                 "connected": False,
             }
+        if not self.config.business_id:
+            return {
+                "status": "MISSING_BUSINESS_ID",
+                "message": "MauzoPilot business ID is required to validate connector access.",
+                "connected": False,
+            }
 
         base_url = self.config.base_url.rstrip("/")
-        # Check standard health endpoint (e.g. /api/health/ or /health)
-        health_path = "api/health/" if "api" not in base_url else "health/"
-        url = f"{base_url}/{health_path}"
+        # MauzoPilot currently routes its public liveness endpoint at /api/health/.
+        url = f"{base_url}/api/health/"
         headers = self._get_headers()
 
         should_close = False
@@ -220,12 +225,29 @@ class MauzoPilotAdapter:
         start_time = time.monotonic()
         try:
             resp = client.get(url, headers=headers)
+            if not 200 <= resp.status_code < 300:
+                return {
+                    "status": "UNAVAILABLE",
+                    "status_code": resp.status_code,
+                    "connected": False,
+                    "latency_ms": round((time.monotonic() - start_time) * 1000, 2),
+                    "base_url": self.config.base_url,
+                    "business_id": self.config.business_id,
+                }
+
+            auth_url = f"{base_url}/api/businesses/{self.config.business_id}/customers/"
+            auth_response = client.get(auth_url, headers=headers)
             latency_ms = round((time.monotonic() - start_time) * 1000, 2)
-            connected = 200 <= resp.status_code < 300
-            status_label = "CONNECTED" if connected else "UNAVAILABLE"
+            connected = 200 <= auth_response.status_code < 300
+            if connected:
+                status_label = "CONNECTED"
+            elif auth_response.status_code in (401, 403):
+                status_label = "AUTHENTICATION_FAILED"
+            else:
+                status_label = "UNAVAILABLE"
             return {
                 "status": status_label,
-                "status_code": resp.status_code,
+                "status_code": auth_response.status_code,
                 "connected": connected,
                 "latency_ms": latency_ms,
                 "base_url": self.config.base_url,
@@ -345,7 +367,7 @@ class MauzoPilotAdapter:
         if not ext_order_id:
             raise ValueError("Order payload must contain an 'id', 'order_number', or 'receipt_number'.")
 
-        order_status = str(external_order_data.get("status", "completed")).lower()
+        order_status = str(external_order_data.get("status", "")).lower()
         if order_status not in ("confirmed", "completed", "fulfilled", "paid"):
             raise ValueError(f"Sales record {ext_order_id} is in status '{order_status}', expected completed/confirmed.")
 
@@ -360,6 +382,24 @@ class MauzoPilotAdapter:
         if existing_mapping:
             inv = Invoice.objects.filter(id=existing_mapping.internal_id, organization=self.organization).first()
             if inv:
+                if external_order_data.get("total_cents") is not None:
+                    reported_total = (
+                        Decimal(str(external_order_data["total_cents"])) / Decimal("100")
+                    ).quantize(Decimal("0.0001"))
+                    if reported_total != inv.total_amount:
+                        raise ValueError(
+                            f"MauzoPilot sale {ext_order_id} total changed from "
+                            f"{inv.total_amount} to {reported_total}."
+                        )
+                if external_order_data.get("subtotal_cents") is not None:
+                    reported_subtotal = (
+                        Decimal(str(external_order_data["subtotal_cents"])) / Decimal("100")
+                    ).quantize(Decimal("0.0001"))
+                    if reported_subtotal != inv.subtotal:
+                        raise ValueError(
+                            f"MauzoPilot sale {ext_order_id} subtotal changed from "
+                            f"{inv.subtotal} to {reported_subtotal}."
+                        )
                 return inv
 
         # Resolve customer
@@ -395,6 +435,24 @@ class MauzoPilotAdapter:
 
         notes = external_order_data.get("notes") or f"Ingested from MauzoPilot Sale #{ext_order_id}"
 
+        subtotal = Decimal("0.0000")
+        tax_total = Decimal("0.0000")
+
+        # MauzoPilot's CloudSale endpoint publishes integer KES cents and has
+        # already validated line arithmetic. Re-check the snapshot at this
+        # boundary before creating any financial record; a stale or malformed
+        # payload must not become an invoice with a different total.
+        upstream_subtotal = (
+            (Decimal(str(subtotal_cents)) / Decimal("100")).quantize(Decimal("0.0001"))
+            if subtotal_cents is not None
+            else None
+        )
+        upstream_total = (
+            (Decimal(str(total_cents)) / Decimal("100")).quantize(Decimal("0.0001"))
+            if total_cents is not None
+            else None
+        )
+
         invoice = Invoice.objects.create(
             organization=self.organization,
             customer=customer,
@@ -406,9 +464,6 @@ class MauzoPilotAdapter:
             notes=notes,
         )
 
-        subtotal = Decimal("0.0000")
-        tax_total = Decimal("0.0000")
-
         if items_data:
             for item in items_data:
                 desc = item.get("product_name") or item.get("description", "Product Item")
@@ -417,6 +472,10 @@ class MauzoPilotAdapter:
                 # Detect unit price in cents vs currency
                 if "unit_price_cents" in item:
                     unit_price = (Decimal(str(item["unit_price_cents"])) / Decimal("100")).quantize(Decimal("0.0001"))
+                    if item.get("unit_price") is not None:
+                        decimal_price = Decimal(str(item["unit_price"])).quantize(Decimal("0.0001"))
+                        if decimal_price != unit_price:
+                            raise ValueError(f"MauzoPilot sale {ext_order_id} has inconsistent unit price fields.")
                 else:
                     unit_price = Decimal(str(item.get("unit_price", "0"))).quantize(Decimal("0.0001"))
 
@@ -430,7 +489,14 @@ class MauzoPilotAdapter:
                     unit_price=unit_price,
                     tax_rate=tax_rate,
                 )
-                subtotal += (line.quantity * line.unit_price).quantize(Decimal("0.0001"))
+                calculated_line_total = (line.quantity * line.unit_price).quantize(Decimal("0.0001"))
+                if item.get("line_total_cents") is not None:
+                    reported_line_total = (
+                        Decimal(str(item["line_total_cents"])) / Decimal("100")
+                    ).quantize(Decimal("0.0001"))
+                    if calculated_line_total != reported_line_total:
+                        raise ValueError(f"MauzoPilot sale {ext_order_id} has a line total that does not match its quantity and price.")
+                subtotal += calculated_line_total
                 tax_total += line.tax_amount
         else:
             # Fallback when lines are not supplied
@@ -448,6 +514,17 @@ class MauzoPilotAdapter:
                 tax_rate=Decimal("0.0000"),
             )
             subtotal = calc_total
+
+        if upstream_subtotal is not None and subtotal != upstream_subtotal:
+            raise ValueError(
+                f"MauzoPilot sale {ext_order_id} line subtotal {subtotal} does not "
+                f"match upstream subtotal {upstream_subtotal}."
+            )
+        if upstream_total is not None and (subtotal + tax_total) != upstream_total:
+            raise ValueError(
+                f"MauzoPilot sale {ext_order_id} invoice total {subtotal + tax_total} "
+                f"does not match upstream total {upstream_total}."
+            )
 
         invoice.subtotal = subtotal
         invoice.tax_amount = tax_total
@@ -526,7 +603,11 @@ class MauzoPilotAdapter:
         synced_customers: list[Customer] = []
         latest_cursor: datetime | None = self.config.customer_sync_cursor
 
-        for item in customer_list[:limit]:
+        # MauzoPilot's current customer endpoint returns the complete matching
+        # list and has no page or after-ID cursor. Process the entire response;
+        # locally truncating it at a timestamp shared by many records would
+        # replay the first records forever and starve the rest.
+        for item in customer_list:
             customer = self.sync_customer(item)
             synced_customers.append(customer)
 

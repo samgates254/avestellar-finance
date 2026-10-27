@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import time
+from datetime import timedelta
 from typing import Any
 import httpx
 from django.utils import timezone
@@ -31,13 +32,19 @@ def verify_webhook_signature(
 
 
 def dispatch_outbox_event(event: OutboxEvent, client: httpx.Client | None = None) -> list[WebhookDelivery]:
-    """Delivers an outbox event to all active webhook subscriptions registered by the organization."""
+    """Deliver an event, preserving failed events for an at-least-once retry."""
     subscriptions = WebhookSubscription.objects.filter(
         organization=event.organization, is_active=True
     )
     matching_subs = [
-        sub for sub in subscriptions
-        if "*" in sub.events or event.event_type in sub.events
+        sub
+        for sub in subscriptions
+        if ("*" in sub.events or event.event_type in sub.events)
+        and not WebhookDelivery.objects.filter(
+            subscription=sub,
+            outbox_event=event,
+            status=DeliveryStatus.SUCCESS,
+        ).exists()
     ]
 
     deliveries = []
@@ -60,6 +67,10 @@ def dispatch_outbox_event(event: OutboxEvent, client: httpx.Client | None = None
         client = httpx.Client(timeout=10.0)
         should_close_client = True
 
+    attempted_at = timezone.now()
+    event.attempts += 1
+    event.last_attempt_at = attempted_at
+    failed = False
     try:
         for sub in matching_subs:
             signature = generate_webhook_signature(sub.secret, timestamp, payload_bytes)
@@ -75,7 +86,9 @@ def dispatch_outbox_event(event: OutboxEvent, client: httpx.Client | None = None
                 subscription=sub,
                 outbox_event=event,
                 status=DeliveryStatus.PENDING,
-                attempts=1,
+                attempts=WebhookDelivery.objects.filter(
+                    subscription=sub, outbox_event=event
+                ).count() + 1,
             )
 
             try:
@@ -90,13 +103,25 @@ def dispatch_outbox_event(event: OutboxEvent, client: httpx.Client | None = None
                 delivery.status = DeliveryStatus.FAILED
                 delivery.response_body = f"Connection error: {str(exc)}"[:1000]
 
-            delivery.save(update_fields=["status", "status_code", "response_body", "attempts"])
+            if delivery.status == DeliveryStatus.FAILED:
+                failed = True
+                retry_seconds = min(60 * (2 ** min(delivery.attempts - 1, 6)), 3600)
+                delivery.next_retry_at = attempted_at + timedelta(seconds=retry_seconds)
+
+            delivery.save(
+                update_fields=[
+                    "status",
+                    "status_code",
+                    "response_body",
+                    "attempts",
+                    "next_retry_at",
+                ]
+            )
             deliveries.append(delivery)
 
-        # Mark outbox event as PROCESSED
-        event.status = OutboxStatus.PROCESSED
-        event.processed_at = timezone.now()
-        event.save(update_fields=["status", "processed_at"])
+        event.status = OutboxStatus.FAILED if failed else OutboxStatus.PROCESSED
+        event.processed_at = None if failed else attempted_at
+        event.save(update_fields=["status", "attempts", "last_attempt_at", "processed_at"])
     finally:
         if should_close_client:
             client.close()

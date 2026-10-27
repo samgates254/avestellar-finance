@@ -74,7 +74,7 @@ class TestPaymentPendingToConfirmedLifecycle:
             organization=self.org,
             business_id="lc-biz-id",
             api_key="lc-api-key",
-            base_url="https://api.mauzopilot.mock/v1",
+            base_url="https://api.mauzopilot.mock",
             webhook_secret="lc-secret",
             is_active=True,
             auto_settle_cash=False,

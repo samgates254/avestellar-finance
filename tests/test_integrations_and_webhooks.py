@@ -1,9 +1,13 @@
 import json
 import time
+import hashlib
+import hmac
+from datetime import UTC, datetime
 from decimal import Decimal
 import httpx
 import pytest
 from rest_framework.test import APIClient
+from django.utils import timezone
 
 from automation.models import DeliveryStatus, OutboxEvent, OutboxStatus, WebhookSubscription
 from automation.services.webhooks import (
@@ -12,7 +16,7 @@ from automation.services.webhooks import (
     verify_webhook_signature,
 )
 from identity.models import User
-from invoicing.models import InvoiceStatus
+from invoicing.models import Customer, Invoice, InvoiceStatus
 from integrations.adapters.mauzopilot import MauzoPilotAdapter
 from integrations.models import ExternalObjectMapping, MauzoPilotConfig
 from ledger.services.initialization import initialize_organization_accounts
@@ -33,7 +37,7 @@ class TestIntegrationsAndWebhooks:
         self.mp_config = MauzoPilotConfig.objects.create(
             organization=self.org,
             business_id="b9a76d1e-2c3f-4e5a-8b9c-1d2e3f4a5b6c",
-            base_url="https://api.mauzopilot.mock/v1",
+            base_url="https://api.mauzopilot.mock",
             api_key="test-api-key-12345",
             webhook_secret="test-webhook-secret-67890",
             is_active=True,
@@ -139,13 +143,37 @@ class TestIntegrationsAndWebhooks:
 
     def test_mauzopilot_test_connection_scenarios(self):
         # 1. Connected
-        transport_ok = httpx.MockTransport(lambda req: httpx.Response(200, json={"status": "ok"}))
+        seen_requests = []
+
+        def successful_health_request(req):
+            seen_requests.append(req)
+            return httpx.Response(200, json={"status": "ok"})
+
+        transport_ok = httpx.MockTransport(successful_health_request)
         with httpx.Client(transport=transport_ok) as client:
             adapter = MauzoPilotAdapter(organization=self.org, client=client)
             result = adapter.test_connection()
             assert result["connected"] is True
             assert result["status"] == "CONNECTED"
             assert result["status_code"] == 200
+        assert str(seen_requests[0].url) == "https://api.mauzopilot.mock/api/health/"
+        assert seen_requests[0].headers["Authorization"] == "Token test-api-key-12345"
+        assert str(seen_requests[1].url) == (
+            "https://api.mauzopilot.mock/api/businesses/"
+            "b9a76d1e-2c3f-4e5a-8b9c-1d2e3f4a5b6c/customers/"
+        )
+
+        def unauthorized_business_request(req):
+            if req.url.path == "/api/health/":
+                return httpx.Response(200, json={"status": "ok"})
+            return httpx.Response(403, json={"detail": "membership required"})
+
+        with httpx.Client(transport=httpx.MockTransport(unauthorized_business_request)) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            auth_result = adapter.test_connection()
+        assert auth_result["connected"] is False
+        assert auth_result["status"] == "AUTHENTICATION_FAILED"
+        assert auth_result["status_code"] == 403
 
         # 2. Upstream Error (500)
         transport_err = httpx.MockTransport(lambda req: httpx.Response(500, text="Internal Server Error"))
@@ -218,6 +246,28 @@ class TestIntegrationsAndWebhooks:
         assert evt is not None
         assert evt.payload["external_id"] == cust_uuid
         assert evt.payload["name"] == "Nairobi Wholesalers Ltd"
+
+    def test_customer_sync_does_not_truncate_records_sharing_timestamp_cursor(self):
+        updated_at = "2026-03-10T12:00:00Z"
+        mock_customers = [
+            {
+                "id": f"same-timestamp-customer-{index}",
+                "name": f"Synthetic Customer {index}",
+                "updated_at_utc": updated_at,
+            }
+            for index in range(105)
+        ]
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json=mock_customers)
+        )
+        with httpx.Client(transport=transport) as client:
+            adapter = MauzoPilotAdapter(organization=self.org, client=client)
+            customers = adapter.pull_customers_incremental(limit=100)
+
+        assert len(customers) == 105
+        assert ExternalObjectMapping.objects.filter(
+            organization=self.org, external_type="customer"
+        ).count() == 105
 
     def test_mauzopilot_incremental_sales_sync_creates_draft_invoice(self):
         sale_uuid = "834cba8a-c603-455b-b98a-78c5d2d0c242"
@@ -533,6 +583,155 @@ class TestIntegrationsAndWebhooks:
             HTTP_X_ORGANIZATION_ID=str(self.org.id),
         )
         assert res_tampered.status_code == 401
+
+    def _post_mauzopilot_event(self, event, *, timestamp=None, secret=None, body=None, business_id=None):
+        timestamp = timestamp or timezone.now().isoformat()
+        body = body or json.dumps(event, separators=(",", ":")).encode()
+        secret = secret or self.mp_config.webhook_secret
+        signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return self.client.post(
+            "/api/v1/integrations/mauzopilot/events/",
+            data=body,
+            content_type="application/json",
+            HTTP_X_MAUZOPILOT_SIGNATURE=f"sha256={signature}",
+            HTTP_X_MAUZOPILOT_TIMESTAMP=timestamp,
+            HTTP_X_ORGANIZATION_ID=business_id or self.mp_config.business_id,
+        )
+
+    def test_mauzopilot_signed_sale_event_is_idempotent_and_creates_draft_invoice(self):
+        sale_id = "11111111-1111-4111-8111-111111111111"
+        event = {
+            "event_id": "evt-sale-1",
+            "event_type": "sale.completed",
+            "schema_version": "1.0",
+            "business_id": self.mp_config.business_id,
+            "data": {
+                "id": sale_id,
+                "receipt_number": "MP-501",
+                "status": "completed",
+                "subtotal_cents": 12550,
+                "total_cents": 12550,
+                "paid_cents": 0,
+                "credit_cents": 12550,
+                "payment_method": "cash",
+                "customer_id": "22222222-2222-4222-8222-222222222222",
+                "items": [{
+                    "description": "Desk lamp",
+                    "quantity": "2",
+                    "unit_price": "62.75",
+                    "unit_price_cents": 6275,
+                    "tax_rate": "0.0",
+                    "line_total": "125.50",
+                    "line_total_cents": 12550,
+                }],
+            },
+        }
+
+        first = self._post_mauzopilot_event(event)
+        second = self._post_mauzopilot_event(event)
+
+        assert first.status_code == 200, first.data
+        assert second.status_code == 200, second.data
+        assert first.data["invoice_id"] == second.data["invoice_id"]
+        invoice = Invoice.objects.get(id=first.data["invoice_id"])
+        assert invoice.status == InvoiceStatus.DRAFT
+        assert invoice.currency == "KES"
+        assert invoice.total_amount == Decimal("125.5000")
+        assert invoice.items.count() == 1
+        assert Invoice.objects.filter(organization=self.org).count() == 1
+        assert ExternalObjectMapping.objects.filter(
+            organization=self.org, external_type="sales_order", external_id=sale_id
+        ).count() == 1
+
+    def test_mauzopilot_event_rejects_bad_signature_stale_timestamp_and_missing_secret(self):
+        event = {
+            "event_id": "evt-customer-1",
+            "event_type": "customer.created",
+            "schema_version": "1.0",
+            "business_id": self.mp_config.business_id,
+            "data": {"id": "mp-webhook-customer", "name": "Synthetic Customer"},
+        }
+        body = json.dumps(event, separators=(",", ":")).encode()
+        valid_signature = hmac.new(
+            self.mp_config.webhook_secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+        altered = body.replace(b"Synthetic Customer", b"Altered Customer")
+        response = self.client.post(
+            "/api/v1/integrations/mauzopilot/events/",
+            data=altered,
+            content_type="application/json",
+            HTTP_X_MAUZOPILOT_SIGNATURE=f"sha256={valid_signature}",
+            HTTP_X_MAUZOPILOT_TIMESTAMP=timezone.now().isoformat(),
+            HTTP_X_ORGANIZATION_ID=self.mp_config.business_id,
+        )
+        assert response.status_code == 401
+
+        stale = datetime(2020, 1, 1, tzinfo=UTC).isoformat()
+        response = self._post_mauzopilot_event(event, timestamp=stale)
+        assert response.status_code == 401
+
+        self.mp_config.webhook_secret = ""
+        self.mp_config.save(update_fields=["webhook_secret"])
+        response = self._post_mauzopilot_event(event)
+        assert response.status_code == 503
+
+    def test_sales_with_mismatched_item_total_are_rejected_without_partial_invoice(self):
+        sale = {
+            "id": "mp-bad-total",
+            "status": "completed",
+            "subtotal_cents": 10000,
+            "total_cents": 10000,
+            "items": [{
+                "description": "Mismatch",
+                "quantity": "1",
+                "unit_price_cents": 9900,
+                "tax_rate": "0.0",
+            }],
+        }
+        with pytest.raises(ValueError, match="does not match upstream subtotal"):
+            self.adapter.sync_sales_order_to_draft_invoice(sale)
+        assert Invoice.objects.filter(organization=self.org).count() == 0
+        assert Customer.objects.filter(organization=self.org).count() == 0
+        assert ExternalObjectMapping.objects.filter(
+            organization=self.org, external_type="sales_order", external_id="mp-bad-total"
+        ).count() == 0
+
+    def test_mauzopilot_event_business_header_must_match_signed_envelope(self):
+        event = {
+            "event_id": "evt-tenant-boundary",
+            "event_type": "customer.created",
+            "schema_version": "1.0",
+            "business_id": self.mp_config.business_id,
+            "data": {"id": "mp-cross-org-customer", "name": "Should Not Sync"},
+        }
+        response = self._post_mauzopilot_event(
+            event,
+            business_id="different-business-id",
+        )
+        assert response.status_code == 404
+        assert Customer.objects.filter(organization=self.org).count() == 0
+
+    def test_repeated_sale_sync_rejects_a_changed_total_for_existing_mapping(self):
+        sale = {
+            "id": "mp-existing-sale",
+            "status": "completed",
+            "subtotal_cents": 10000,
+            "total_cents": 10000,
+            "items": [{
+                "description": "Existing item",
+                "quantity": "1",
+                "unit_price_cents": 10000,
+                "line_total_cents": 10000,
+                "tax_rate": "0.0",
+            }],
+        }
+        original = self.adapter.sync_sales_order_to_draft_invoice(sale)
+        conflicting = {**sale, "total_cents": 12500}
+        with pytest.raises(ValueError, match="total changed"):
+            self.adapter.sync_sales_order_to_draft_invoice(conflicting)
+        original.refresh_from_db()
+        assert original.total_amount == Decimal("100.0000")
+        assert Invoice.objects.filter(organization=self.org).count() == 1
 
     def test_n8n_inbound_webhook_additional_actions(self):
         secret = "n8n-shared-secret-actions"
