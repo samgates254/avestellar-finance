@@ -2,7 +2,7 @@
 
 ## 1. Architectural Overview
 
-The AVESTELLAR FINANCE Reconciliation Engine connects external statement evidence (Bank and Safaricom M-Pesa statements) with internal general ledger records, payments, and customer invoices. 
+The AVESTELLAR FINANCE Reconciliation Engine connects external statement evidence (Bank and Safaricom M-Pesa statements) with internal general ledger records, payments, and customer invoices.
 
 ### Core Architectural Principle
 > **Every match must have evidence, every financial state change must be auditable, and duplicate imports must not cause duplicate accounting entries.**

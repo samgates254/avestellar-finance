@@ -12,7 +12,7 @@ AVESTELLAR FINANCE provides explicit parser adapters with validated input contra
 
 ## 2. Cryptographic Batch Deduplication
 
-Repeated file uploads must not produce duplicate statement transactions. 
+Repeated file uploads must not produce duplicate statement transactions.
 - Each uploaded file is hashed using **SHA-256**:
   $$\text{hash} = \text{SHA-256}(\text{file\_content})$$
 - A database constraint on `(organization, financial_account, file_hash)` rejects re-importing the identical file for the same account:

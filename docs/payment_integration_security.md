@@ -36,7 +36,7 @@ Provider HTTP Callback (C2B / STK Push)
 ## 2. Daraja Contract Adherence
 
 ### 2.1 Why There Is No Provider Signature Header
-Unlike Stripe or GitHub, Safaricom Daraja does **not** provide an HMAC signature header (such as `X-Daraja-Signature`) on C2B or STK push callbacks. 
+Unlike Stripe or GitHub, Safaricom Daraja does **not** provide an HMAC signature header (such as `X-Daraja-Signature`) on C2B or STK push callbacks.
 Therefore, AVESTELLAR FINANCE enforces defense-in-depth:
 1. **Shortcode Binding**: Every callback is validated against the tenant's configured shortcode (`DarajaConfig.short_code`).
 2. **Database Replay Guard**: Every incoming `TransID` is recorded in `DarajaCallbackEvent`. If a duplicate `TransID` arrives, it is rejected or acknowledged idempotently without posting a second journal entry.
