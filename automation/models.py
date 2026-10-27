@@ -103,6 +103,8 @@ class IdempotencyRecord(models.Model):
     )
     key = models.CharField(max_length=255, db_index=True)
     request_path = models.CharField(max_length=255)
+    request_method = models.CharField(max_length=10, default="POST")
+    actor = models.CharField(max_length=64, blank=True, db_index=True)
     request_hash = models.CharField(max_length=64)
     response_status = models.PositiveIntegerField()
     response_body = models.JSONField(default=dict)

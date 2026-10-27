@@ -7,6 +7,7 @@ from rest_framework.views import APIView
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
 
+from automation.idempotency import idempotent_action
 from ledger.exceptions import AccountingError
 from ledger.models import (
     Account,
@@ -33,6 +34,20 @@ from organizations.permissions import (
     IsOrgAdminOrOwner,
     IsOrganizationMember,
     get_request_organization,
+)
+
+# Optional client-generated key for replay-safe creation. See automation.idempotency.
+IDEMPOTENCY_KEY_PARAM = OpenApiParameter(
+    name="Idempotency-Key",
+    type=OpenApiTypes.STR,
+    location=OpenApiParameter.HEADER,
+    required=False,
+    description=(
+        "Optional key that makes this creation replay-safe. Retrying with the same "
+        "key and identical payload returns the original result instead of creating a "
+        "duplicate record; reusing the key for a different payload returns 409. Keys "
+        "are scoped to the organization and authenticated actor."
+    ),
 )
 
 
@@ -119,10 +134,18 @@ class AccountingPeriodCloseView(APIView):
 
 @extend_schema_view(
     get=extend_schema(summary="List Journal Entries", description="Query general ledger journal entries with status filtering."),
-    post=extend_schema(summary="Create Draft Journal Entry", description="Create a balanced draft journal entry with lines."),
+    post=extend_schema(
+        summary="Create Draft Journal Entry",
+        description="Create a balanced draft journal entry with lines. Supports the optional Idempotency-Key header for replay-safe creation.",
+        parameters=[IDEMPOTENCY_KEY_PARAM],
+    ),
 )
 class JournalEntryListCreateView(generics.ListCreateAPIView):
     permission_classes = (permissions.IsAuthenticated, IsAccountantOrAbove)
+
+    @idempotent_action
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
 
     def get_serializer_class(self):
         if self.request.method == "POST":

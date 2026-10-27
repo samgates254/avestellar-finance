@@ -3,7 +3,7 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import extend_schema, extend_schema_view
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
 
 from automation.idempotency import idempotent_action
 from invoicing.models import Customer, Invoice
@@ -15,10 +15,28 @@ from organizations.permissions import (
     get_request_organization,
 )
 
+# Optional client-generated key for replay-safe creation. See automation.idempotency.
+IDEMPOTENCY_KEY_PARAM = OpenApiParameter(
+    name="Idempotency-Key",
+    type=OpenApiTypes.STR,
+    location=OpenApiParameter.HEADER,
+    required=False,
+    description=(
+        "Optional key that makes this creation replay-safe. Retrying with the same "
+        "key and identical payload returns the original result instead of creating a "
+        "duplicate record; reusing the key for a different payload returns 409. Keys "
+        "are scoped to the organization and authenticated actor."
+    ),
+)
+
 
 @extend_schema_view(
     get=extend_schema(summary="List Customers", description="List all customers for the active organization."),
-    post=extend_schema(summary="Create Customer", description="Add a new customer profile."),
+    post=extend_schema(
+        summary="Create Customer",
+        description="Add a new customer profile. Supports the optional Idempotency-Key header for replay-safe creation.",
+        parameters=[IDEMPOTENCY_KEY_PARAM],
+    ),
 )
 class CustomerListCreateView(generics.ListCreateAPIView):
     serializer_class = CustomerSerializer
@@ -57,11 +75,19 @@ class CustomerDetailView(generics.RetrieveUpdateAPIView):
 
 @extend_schema_view(
     get=extend_schema(summary="List Invoices", description="List sales invoices with customer details."),
-    post=extend_schema(summary="Create Draft Invoice", description="Create a new draft sales invoice with line items."),
+    post=extend_schema(
+        summary="Create Draft Invoice",
+        description="Create a new draft sales invoice with line items. Supports the optional Idempotency-Key header for replay-safe creation.",
+        parameters=[IDEMPOTENCY_KEY_PARAM],
+    ),
 )
 class InvoiceListCreateView(generics.ListCreateAPIView):
     serializer_class = InvoiceSerializer
     permission_classes = (permissions.IsAuthenticated, IsAccountantOrAbove)
+
+    @idempotent_action
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):

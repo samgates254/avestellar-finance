@@ -158,9 +158,12 @@ class JournalEntryDetailSerializer(serializers.ModelSerializer):
         lines_data = validated_data.pop("lines")
         entry = JournalEntry.objects.create(**validated_data)
         for idx, line_data in enumerate(lines_data, start=1):
+            # ``sequence`` is an explicit keyword here, so it must be removed from
+            # line_data to avoid passing it twice to .create().
+            sequence = line_data.pop("sequence", idx)
             JournalLine.objects.create(
                 journal_entry=entry,
-                sequence=line_data.get("sequence", idx),
+                sequence=sequence,
                 **line_data,
             )
         return entry
