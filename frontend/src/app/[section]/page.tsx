@@ -1,0 +1,3 @@
+"use client";
+import Link from "next/link"; import { useParams } from "next/navigation"; import { Shell } from "@/components/shell"; import { Workspace } from "@/components/workspace"; import { useSession } from "@/components/session";
+export default function SectionPage() { const params = useParams<{ section: string }>(); const { tokens } = useSession(); return tokens ? <Shell><Workspace section={params.section} /></Shell> : <div className="login-screen"><div className="login-card"><div className="brand"><span className="brand-mark">A</span><span>AVESTELLAR<small>FINANCE</small></span></div><h1>Sign in required</h1><p>Your session is not available in this tab.</p><Link className="button button-primary" href="/">Return to sign in</Link></div></div>; }

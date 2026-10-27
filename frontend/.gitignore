@@ -1,0 +1,9 @@
+node_modules/
+.next/
+coverage/
+.env.local
+*.tsbuildinfo
+# Playwright browser-E2E generated artifacts
+test-results/
+playwright-report/
+.pwtmp/

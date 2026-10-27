@@ -1,0 +1,36 @@
+{
+  "name": "avestellar-finance-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "test:e2e:run": "bash ../scripts/run_browser_e2e.sh"
+  },
+  "dependencies": {
+    "next": "15.5.28",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.0",
+    "@types/node": "22.19.0",
+    "@types/react": "19.1.16",
+    "@types/react-dom": "19.1.9",
+    "autoprefixer": "10.4.22",
+    "eslint": "9.39.1",
+    "eslint-config-next": "15.5.28",
+    "jsdom": "27.2.0",
+    "postcss": "8.5.6",
+    "tailwindcss": "3.4.17",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}
