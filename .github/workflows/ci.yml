@@ -1,0 +1,304 @@
+# AVESTELLAR FINANCE — automated quality gates.
+#
+# Three independent jobs, each on an ephemeral GitHub-hosted runner:
+#   backend       Django checks, migration drift, PostgreSQL test suite,
+#                 OpenAPI validation, security suites.
+#   frontend      Frozen pnpm install, lint, typecheck, unit tests, production build.
+#   browser-e2e   Real Next.js + real Django + disposable PostgreSQL via
+#                 scripts/run_browser_e2e.sh (no financial API mocking).
+#
+# Nothing here deploys, provisions cloud resources, or contacts a payment
+# provider. The only credentials used are synthetic values for the throwaway
+# PostgreSQL service container. Developer .env files never exist on a runner.
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: these jobs only read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Synthetic CI configuration. None of these values is a real secret and none
+  # unlocks a provider. DJANGO_ENV=test + DEBUG=True keeps the suite on its
+  # development ergonomics; the deployed (fail-closed) rules are covered by
+  # dedicated subprocess tests and by the staging `check --deploy` step below.
+  DJANGO_ENV: test
+  DEBUG: "True"
+  SECRET_KEY: "ci-only-synthetic-secret-0123456789abcdefghijklmnop"
+  ALLOWED_HOSTS: "localhost,127.0.0.1"
+  MAUZOPILOT_ENABLED: "False"
+  MAUZOPILOT_API_KEY: ""
+  MAUZOPILOT_WEBHOOK_SECRET: ""
+  AI_ASSISTANT_ENABLED: "False"
+  AI_ASSISTANT_API_KEY: ""
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  backend:
+    # One suite, two supported majors. PostgreSQL 16 is what staging runs today;
+    # 18 is the next major the application must survive. Both were verified
+    # against the full suite (16.9 and 18.6) before this matrix existed, so it
+    # records a proven fact rather than searching for a green cell.
+    name: Backend (Python pin + PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "18"]
+    services:
+      postgres:
+        # Throwaway service container. Credentials are synthetic, the database
+        # is destroyed with the runner, and nothing outside this job can reach it.
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: avestellar_ci
+          POSTGRES_PASSWORD: ci_synthetic_password
+          POSTGRES_DB: avestellar_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U avestellar_ci -d avestellar_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://avestellar_ci:ci_synthetic_password@127.0.0.1:5432/avestellar_ci
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Single source of truth: the repository pin. No competing literal
+          # survives in this file, so CI cannot drift from .python-version.
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Refuse to run against a non-CI database
+        run: |
+          python - <<'PY'
+          import os
+
+          import django
+
+          os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+          django.setup()
+
+          from django.db import connection
+
+          name = str(connection.settings_dict["NAME"])
+          assert name != "avestellar_finance", (
+              "Refusing to run CI tests against the development database."
+          )
+          assert name == "avestellar_ci", f"Unexpected CI database target: {name}"
+          print(f"CI database target confirmed: {name}")
+          PY
+
+      - name: Django system checks
+        run: python manage.py check
+
+      - name: Migration consistency (no uncommitted model drift)
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Security suites (config, auth, Daraja, provider secrets, credentials)
+        run: |
+          python -m pytest -q \
+            tests/test_settings_hardening.py \
+            tests/test_cache_configuration.py \
+            tests/test_auth_security.py \
+            tests/test_daraja_callback.py \
+            tests/test_provider_secrets.py \
+            tests/test_statement_upload_limits.py \
+            tests/test_no_committed_credentials.py \
+            tests/test_dependency_pinning.py
+
+      - name: Backend test suite (PostgreSQL, fresh test database)
+        run: python -m pytest -q --create-db
+
+      - name: OpenAPI schema validation
+        run: python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
+
+      - name: Staging deploy checks (fail-closed configuration)
+        env:
+          DJANGO_ENV: staging
+          DEBUG: "False"
+          ALLOWED_HOSTS: ci.avestellar.invalid
+          SECRET_KEY: ci-only-synthetic-secret-0123456789abcdefghijklmnop
+        run: |
+          output="$(python manage.py check --deploy 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          # `check --deploy` exits 0 for warnings, so the warning set itself is the
+          # gate. security.W021 (HSTS preload) cannot be satisfied until the real
+          # hostname exists and is submitted. Anything else is a new regression.
+          unexpected="$(printf '%s\n' "$output" \
+            | grep -o 'security\.[WE][0-9]\{1,3\}' \
+            | sort -u \
+            | grep -v '^security\.W021$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected deploy-check findings: $unexpected" >&2
+            exit 1
+          fi
+          echo "Deploy check clean (only the provider-dependent W021 warning)."
+
+      - name: Upload OpenAPI schema
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-schema
+          path: /tmp/avestellar-openapi.yaml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  frontend:
+    name: Frontend (Node 22 + pnpm, frozen lockfile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.10.1
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies (lockfile-exact)
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Unit tests
+        run: pnpm run test
+
+      - name: Production build
+        run: pnpm run build
+
+  browser-e2e:
+    name: Browser E2E (real Next.js + real Django, disposable PostgreSQL 16)
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        # Staging-aligned major. The browser journey is meant to prove the stack
+        # staging actually runs, so it is pinned to 16 rather than to the newest
+        # major the backend matrix also covers.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: avestellar_ci
+          POSTGRES_PASSWORD: ci_synthetic_password
+          POSTGRES_DB: avestellar_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U avestellar_ci -d avestellar_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Admin connection used only to CREATE/DROP the prefixed disposable DB.
+      DATABASE_URL: postgresql://avestellar_ci:ci_synthetic_password@127.0.0.1:5432/avestellar_ci
+      E2E_AV_DATABASE_NAME: avestellar_live_http_ci_e2e
+      E2E_DJANGO_PORT: "8200"
+      E2E_NEXT_PORT: "3100"
+      E2E_DROP_DB: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Single source of truth: the repository pin. No competing literal
+          # survives in this file, so CI cannot drift from .python-version.
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.10.1
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies (lockfile-exact)
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Chromium for Playwright
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Resolve the interpreter for the E2E runner
+        # setup-python installs into a tool cache, so the runner's default
+        # `<repo>/.venv/bin/python` does not exist. Hand the script the absolute
+        # path of the interpreter that actually has requirements.txt installed.
+        run: |
+          echo "E2E_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
+      - name: Run guarded browser E2E lifecycle
+        run: bash scripts/run_browser_e2e.sh
+
+      - name: Upload Playwright diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-diagnostics
+          path: |
+            frontend/test-results
+            frontend/playwright-report
+          if-no-files-found: ignore
+          retention-days: 7

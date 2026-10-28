@@ -19,3 +19,15 @@ DATABASES["default"]["CONN_MAX_AGE"] = 0  # noqa: F405
 DEBUG = True
 ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 SECRET_KEY = "synthetic-local-http-integration-only"
+
+# E2E drives the real login endpoint repeatedly across sequential journeys.
+# Rate limiting is validated by the dedicated backend security suite, so it is
+# relaxed here to avoid spurious HTTP 429s interrupting full-stack journeys.
+REST_FRAMEWORK = {  # noqa: F405
+    **REST_FRAMEWORK,  # noqa: F405
+    "DEFAULT_THROTTLE_RATES": {
+        **REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"],  # noqa: F405
+        "login": "1000/hour",
+        "register": "1000/hour",
+    },
+}

@@ -8,18 +8,22 @@
 # "avestellar_live_http_" disposable prefix. It refuses to touch the ordinary
 # development database or any pre-existing development server.
 #
-# Requires: bash, psql, a PostgreSQL server, the project .venv, and pnpm.
+# Requires: bash, psql, a PostgreSQL server, a Python interpreter with the
+# backend requirements installed, and pnpm.
 # Configure via environment (safe local defaults shown):
 #   DATABASE_URL           postgresql://user:pass@host:port/<admin_db>  (DDL admin conn)
 #   E2E_AV_DATABASE_NAME   disposable DB name  (default: avestellar_live_http_browser_e2e)
 #   E2E_DJANGO_PORT        isolated Django port (default: 8200)
 #   E2E_NEXT_PORT          isolated Next port   (default: 3100)
 #   E2E_DROP_DB            1 to drop the disposable DB afterwards (default: 0)
+#   E2E_PYTHON             interpreter to use (default: $ROOT/.venv/bin/python).
+#                          CI sets this to the runner interpreter it installed
+#                          requirements into; local runs keep using the .venv.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FRONTEND="$ROOT/frontend"
-VENV_PY="$ROOT/.venv/bin/python"
+VENV_PY="${E2E_PYTHON:-$ROOT/.venv/bin/python}"
 
 # All transient files (launcher, pidfiles, logs) live under a project-local,
 # git-ignored runtime dir. On some sandboxes `/tmp` is read-only, so we never
@@ -41,7 +45,11 @@ DROP_DB="${E2E_DROP_DB:-0}"
 fail() { echo "E2E ABORT: $*" >&2; exit 1; }
 
 # ---- 1. Validate environment, target database, and safety invariants --------
-[[ -x "$VENV_PY" ]] || fail "project venv python not found at $VENV_PY"
+[[ -x "$VENV_PY" ]] || fail "python interpreter not found at $VENV_PY (set E2E_PYTHON to override)"
+# A bare system python satisfies the executable check but fails later with an
+# obscure traceback, so verify the requirements are actually importable first.
+"$VENV_PY" -c "import django, environ" 2>/dev/null \
+  || fail "interpreter at $VENV_PY cannot import the backend requirements (django, django-environ)"
 [[ -d "$FRONTEND" ]] || fail "frontend directory not found"
 [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL must be set (a PostgreSQL connection)"
 
