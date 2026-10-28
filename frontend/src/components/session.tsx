@@ -6,7 +6,10 @@ const Context = createContext<SessionValue | null>(null);
 export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [tokens, setTokens] = useState<Tokens | null>(null); const [organizations, setOrganizations] = useState<Organization[]>([]); const [organizationId, setOrganizationId] = useState(""); const [user, setUser] = useState<SessionValue["user"]>(null); const [loading, setLoading] = useState(false); const [error, setError] = useState("");
   const organization = organizations.find((item) => item.id === organizationId) ?? null;
-  const logout = useCallback(() => { setTokens(null); setSession(null, null); setOrganization(null); setOrganizations([]); setOrganizationId(""); setUser(null); }, []);
+  // Revoke the refresh token server-side (best effort) then purge all tokens
+  // from memory. The network call captures the access token synchronously
+  // before we clear state, so revocation stays authenticated.
+  const logout = useCallback(() => { const refresh = tokens?.refresh; if (refresh) { void api("/auth/logout/", { method: "POST", body: JSON.stringify({ refresh }) }).catch(() => {}); } setTokens(null); setSession(null, null); setOrganization(null); setOrganizations([]); setOrganizationId(""); setUser(null); }, [tokens]);
   const reload = useCallback(async () => { if (!tokens) return; setLoading(true); setError(""); try { const [profile, orgs] = await Promise.all([api<{ email: string; full_name: string }>("/auth/me/"), api<Organization[] | { results: Organization[] }>("/organizations/")]); const items = Array.isArray(orgs) ? orgs : orgs.results; setUser(profile); setOrganizations(items); setOrganizationId((current) => items.some((item) => item.id === current) ? current : items[0]?.id ?? ""); } catch (e) { setError(e instanceof Error ? e.message : "Could not load your finance workspace."); } finally { setLoading(false); } }, [tokens]);
   useEffect(() => { void reload(); }, [reload]);
   useEffect(() => { const expired = () => logout(); window.addEventListener("session-expired", expired); return () => window.removeEventListener("session-expired", expired); }, [logout]);

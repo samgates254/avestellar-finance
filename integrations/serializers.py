@@ -1,8 +1,14 @@
 from rest_framework import serializers
+
+from config.secret_serializers import SecretFieldProtectionMixin
 from integrations.models import ExternalObjectMapping, IntegrationSyncLog, MauzoPilotConfig
 
 
-class MauzoPilotConfigSerializer(serializers.ModelSerializer):
+class MauzoPilotConfigSerializer(SecretFieldProtectionMixin, serializers.ModelSerializer):
+    # Both are provider credentials: write-only, and never wiped by a blank PATCH
+    # unless the caller sends clear_secrets=true.
+    secret_fields = ("api_key", "webhook_secret")
+
     class Meta:
         model = MauzoPilotConfig
         fields = (
@@ -36,10 +42,6 @@ class MauzoPilotConfigSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         )
-        extra_kwargs = {
-            "api_key": {"write_only": True},
-            "webhook_secret": {"write_only": True},
-        }
 
 
 class IntegrationHealthSerializer(serializers.Serializer):
@@ -85,7 +87,11 @@ class IntegrationSyncLogSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
-class DarajaConfigSerializer(serializers.ModelSerializer):
+class DarajaConfigSerializer(SecretFieldProtectionMixin, serializers.ModelSerializer):
+    # consumer_key identifies the app and consumer_secret/passkey authenticate it;
+    # all three are treated as credentials and are never returned by the API.
+    secret_fields = ("consumer_key", "consumer_secret", "passkey")
+
     deposit_account_name = serializers.CharField(
         source="default_deposit_account.name", read_only=True
     )
@@ -108,10 +114,6 @@ class DarajaConfigSerializer(serializers.ModelSerializer):
             "updated_at",
         )
         read_only_fields = ("id", "deposit_account_name", "created_at", "updated_at")
-        extra_kwargs = {
-            "consumer_secret": {"write_only": True},
-            "passkey": {"write_only": True},
-        }
 
 
 class DarajaCallbackEventSerializer(serializers.ModelSerializer):

@@ -1,7 +1,15 @@
 from decimal import Decimal
+from pathlib import Path
+
+from django.conf import settings
 from rest_framework import serializers
 from ledger.models import Account
 from payments.models import Payment, PaymentMethod, PaymentStatus, PaymentType
+
+# Statement formats the parsers understand. Uploads are matched by suffix rather
+# than by client-supplied content type, which is trivially spoofed.
+ALLOWED_STATEMENT_SUFFIXES = frozenset({".csv", ".txt", ".ofx", ".qfx", ".mt940", ".sta"})
+DEFAULT_MAX_STATEMENT_UPLOAD_BYTES = 15 * 1024 * 1024
 
 
 class PaymentSerializer(serializers.ModelSerializer):
@@ -138,6 +146,53 @@ class StatementImportUploadSerializer(serializers.Serializer):
     file_name = serializers.CharField(required=False, default="statement.csv")
     column_mapping = serializers.DictField(required=False, default=dict)
     date_format = serializers.CharField(required=False, allow_blank=True)
+
+    def _max_bytes(self) -> int:
+        return int(
+            getattr(
+                settings, "MAX_STATEMENT_UPLOAD_BYTES", DEFAULT_MAX_STATEMENT_UPLOAD_BYTES
+            )
+        )
+
+    def _check_size(self, size: int, field: str) -> None:
+        limit = self._max_bytes()
+        if size > limit:
+            raise serializers.ValidationError(
+                {field: f"File exceeds the {limit // (1024 * 1024)} MB statement limit."}
+            )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        upload = attrs.get("file")
+        if upload is not None:
+            self._check_size(upload.size, "file")
+            suffix = Path(upload.name or "").suffix.lower()
+            if suffix not in ALLOWED_STATEMENT_SUFFIXES:
+                raise serializers.ValidationError(
+                    {
+                        "file": (
+                            "Unsupported statement file type "
+                            f"'{suffix or 'unknown'}'. Allowed: "
+                            + ", ".join(sorted(ALLOWED_STATEMENT_SUFFIXES))
+                            + "."
+                        )
+                    }
+                )
+            return attrs
+
+        content = attrs.get("file_content")
+        if content:
+            # The string form travels inside a JSON body, so it must also respect
+            # the statement ceiling (and DATA_UPLOAD_MAX_MEMORY_SIZE).
+            self._check_size(len(content.encode("utf-8")), "file_content")
+            suffix = Path(attrs.get("file_name") or "").suffix.lower()
+            if suffix and suffix not in ALLOWED_STATEMENT_SUFFIXES:
+                raise serializers.ValidationError(
+                    {"file_name": f"Unsupported statement file type '{suffix}'."}
+                )
+
+        return attrs
 
 
 class ReconciliationSessionSerializer(serializers.ModelSerializer):

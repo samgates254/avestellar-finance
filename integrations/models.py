@@ -137,6 +137,10 @@ class DarajaCallbackStatus(models.TextChoices):
     PROCESSED = "PROCESSED", "Processed"
     DUPLICATE = "DUPLICATE", "Duplicate Ignored"
     FAILED = "FAILED", "Failed"
+    # Recorded and attributable, but not corroborated by anything the business
+    # initiated. Held payloads never settle an invoice or post a journal and must
+    # never be treated as trusted payment evidence.
+    HELD = "HELD", "Held for Review"
 
 
 class DarajaCallbackEvent(models.Model):

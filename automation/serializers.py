@@ -1,8 +1,15 @@
 from rest_framework import serializers
+
 from automation.models import OutboxEvent, WebhookDelivery, WebhookSubscription
+from config.secret_serializers import SecretFieldProtectionMixin
 
 
-class WebhookSubscriptionSerializer(serializers.ModelSerializer):
+class WebhookSubscriptionSerializer(SecretFieldProtectionMixin, serializers.ModelSerializer):
+    # The HMAC signing secret is write-only and is not erased by a blank PATCH;
+    # clear_secrets=true is required for that.
+    secret_fields = ("secret",)
+    secret_fields_required_on_create = ("secret",)
+
     class Meta:
         model = WebhookSubscription
         fields = (
@@ -14,9 +21,6 @@ class WebhookSubscriptionSerializer(serializers.ModelSerializer):
             "created_at",
         )
         read_only_fields = ("id", "created_at")
-        extra_kwargs = {
-            "secret": {"write_only": True},
-        }
 
 
 class WebhookDeliverySerializer(serializers.ModelSerializer):

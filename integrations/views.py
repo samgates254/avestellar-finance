@@ -394,18 +394,58 @@ class DarajaConfigView(APIView):
 
 
 def _resolve_daraja_org(request) -> Organization | None:
-    """Resolves target organization from header, query param, or BusinessShortCode."""
+    """Resolve the organization a Daraja callback genuinely belongs to.
+
+    Inbound Daraja callbacks are unauthenticated: Safaricom does not sign them
+    with a request HMAC we could verify. A caller-supplied organization header
+    or query parameter is therefore NOT treated as proof of ownership or
+    authority (an attacker could set it to any org id). The organization must be
+    derived from server-side state that the business itself created:
+
+      - C2B: the payload's BusinessShortCode maps to that organization's active
+        DarajaConfig, which only a member could configure.
+      - STK Push: the CheckoutRequestID/MerchantRequestID matches a PENDING
+        payment this system initiated for the organization (creating such a
+        payment requires authentication and org membership).
+
+    If neither binds, the callback is unattributable and the view rejects it.
+    """
     from integrations.models import DarajaConfig
+    from payments.models import Payment, PaymentStatus
 
-    org_id = request.headers.get("X-Organization-ID") or request.query_params.get("organization_id")
-    if org_id:
-        return Organization.objects.filter(id=org_id, is_active=True).first()
+    payload = request.data if isinstance(request.data, dict) else {}
 
-    short_code = request.data.get("BusinessShortCode")
+    # C2B: authoritative binding via the pay-bill short code.
+    short_code = payload.get("BusinessShortCode")
     if short_code:
-        cfg = DarajaConfig.objects.filter(short_code=short_code, organization__is_active=True).first()
+        cfg = (
+            DarajaConfig.objects.filter(
+                short_code=str(short_code).strip(), organization__is_active=True
+            )
+            .select_related("organization")
+            .first()
+        )
         if cfg:
             return cfg.organization
+
+    # STK Push: bind only to a payment the business already initiated.
+    body = payload.get("Body")
+    stk_body = body.get("stkCallback", {}) if isinstance(body, dict) else {}
+    checkout_id = stk_body.get("CheckoutRequestID") or payload.get("CheckoutRequestID")
+    merchant_id = stk_body.get("MerchantRequestID") or payload.get("MerchantRequestID")
+    identifiers = [str(i).strip() for i in (checkout_id, merchant_id) if i]
+    if identifiers:
+        payment = (
+            Payment.objects.filter(
+                status=PaymentStatus.PENDING,
+                reference__in=identifiers,
+                organization__is_active=True,
+            )
+            .select_related("organization")
+            .first()
+        )
+        if payment:
+            return payment.organization
 
     return None
 

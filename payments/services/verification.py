@@ -59,6 +59,31 @@ class PaymentVerificationResult:
     metadata: dict[str, Any] | None = None
 
 
+def _callback_amount(event: DarajaCallbackEvent) -> Decimal | None:
+    """Amount stated by the provider payload, or None when it states none.
+
+    C2B payloads carry ``TransAmount``; STK payloads carry the amount inside
+    ``Body.stkCallback.CallbackMetadata.Item``. An event without a comparable
+    amount cannot be evidence for a specific sum.
+    """
+    payload = event.payload if isinstance(event.payload, dict) else {}
+
+    raw = payload.get("TransAmount")
+    if raw is None:
+        body = payload.get("Body")
+        stk_body = body.get("stkCallback") if isinstance(body, dict) else None
+        metadata = stk_body.get("CallbackMetadata") if isinstance(stk_body, dict) else None
+        items = metadata.get("Item") if isinstance(metadata, dict) else None
+        for item in items or []:
+            if isinstance(item, dict) and item.get("Name") == "Amount":
+                raw = item.get("Value")
+                break
+
+    if raw is None or str(raw).strip() == "":
+        return None
+    return clean_decimal(raw)
+
+
 def verify_payment_evidence(
     organization: Organization,
     invoice: Invoice,
@@ -173,36 +198,44 @@ def verify_payment_evidence(
 
     # 6. M-PESA Verification Policy
     if "MPESA" in method_normalized:
-        # Check if trusted Daraja callback event exists
-        daraja_event = DarajaCallbackEvent.objects.filter(
-            organization=organization,
-            transaction_id=reference,
-            callback_type__in=(DarajaCallbackType.C2B_CONFIRMATION, DarajaCallbackType.STK_PUSH),
-            status=DarajaCallbackStatus.PROCESSED,
-        ).first()
+        # Only a corroborated callback counts as evidence. A payload that was
+        # merely recorded (HELD) or whose payment is still awaiting review
+        # (matched payment PENDING) proves nothing about the money arriving, so
+        # it can never promote a payment on its own.
+        daraja_event = (
+            DarajaCallbackEvent.objects.filter(
+                organization=organization,
+                transaction_id=reference,
+                callback_type__in=(
+                    DarajaCallbackType.C2B_CONFIRMATION,
+                    DarajaCallbackType.STK_PUSH,
+                ),
+                status=DarajaCallbackStatus.PROCESSED,
+            )
+            .exclude(matched_payment__status=PaymentStatus.PENDING)
+            .first()
+        )
 
         if daraja_event:
-            # Verify amount matches callback
-            cb_amount_str = daraja_event.payload.get("TransAmount")
-            if cb_amount_str is not None:
-                cb_amount = clean_decimal(cb_amount_str)
-                if cb_amount == amount:
-                    deposit_acc = Account.objects.filter(
-                        organization=organization, code="1020", is_active=True
-                    ).first() or Account.objects.filter(
-                        organization=organization, system_role="CLEARING", is_active=True
-                    ).first() or Account.objects.filter(
-                        organization=organization, code="1010", is_active=True
-                    ).first()
+            # The callback must state an amount equal to the claim being verified.
+            cb_amount = _callback_amount(daraja_event)
+            if cb_amount is not None and cb_amount == amount:
+                deposit_acc = Account.objects.filter(
+                    organization=organization, code="1020", is_active=True
+                ).first() or Account.objects.filter(
+                    organization=organization, system_role="CLEARING", is_active=True
+                ).first() or Account.objects.filter(
+                    organization=organization, code="1010", is_active=True
+                ).first()
 
-                    if deposit_acc:
-                        return PaymentVerificationResult(
-                            verified=True,
-                            evidence_type="DARAJA_CALLBACK",
-                            deposit_account=deposit_acc,
-                            reason=f"Verified through confirmed Safaricom Daraja callback {reference}.",
-                            metadata={"daraja_event_id": str(daraja_event.id), "callback_type": daraja_event.callback_type},
-                        )
+                if deposit_acc:
+                    return PaymentVerificationResult(
+                        verified=True,
+                        evidence_type="DARAJA_CALLBACK",
+                        deposit_account=deposit_acc,
+                        reason=f"Verified through confirmed Safaricom Daraja callback {reference}.",
+                        metadata={"daraja_event_id": str(daraja_event.id), "callback_type": daraja_event.callback_type},
+                    )
 
         # Check if cleared StatementTransaction exists in imported M-Pesa batch
         stmt_trx = StatementTransaction.objects.filter(

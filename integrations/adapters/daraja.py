@@ -1,7 +1,21 @@
-"""Safaricom Daraja M-Pesa API and Callback Boundary Adapter."""
+"""Safaricom Daraja M-Pesa API and Callback Boundary Adapter.
 
+Security model
+--------------
+Safaricom sends Daraja callbacks without a request signature we can verify, so an
+inbound callback is treated as *untrusted input*: it is attributed to an
+organization only through server-side state the business itself created (a
+configured business short code, or a PENDING payment it initiated). A callback is
+never, on its own, sufficient evidence to settle an invoice. It is promoted to a
+CONFIRMED payment only when it corroborates an initiated payment across amount,
+currency, reference and invoice state; otherwise the payload is recorded and held
+for review (``DarajaCallbackStatus.HELD``).
+"""
+
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
+
 from django.db import transaction
 from django.utils import timezone
 
@@ -17,7 +31,6 @@ from invoicing.models import Invoice, InvoiceStatus
 from ledger.models import Account
 from organizations.models import Organization
 from payments.models import Payment, PaymentMethod, PaymentStatus, PaymentType
-from payments.services import record_and_confirm_customer_payment
 from payments.services.statement_parsers.bank_csv import clean_decimal
 from payments.services.verification import settle_pending_payment
 
@@ -27,8 +40,39 @@ class DarajaAdapterError(Exception):
     pass
 
 
+class DarajaVerificationUnavailable(DarajaAdapterError):
+    """Raised when no genuine provider-status verification is available.
+
+    Present so callers cannot quietly substitute a synthetic response for real
+    provider evidence. This milestone deliberately does not implement the Daraja
+    Transaction Status / reconciliation protocol.
+    """
+    pass
+
+
+@dataclass(frozen=True)
+class VerifiedPaymentResult:
+    """Independently verified provider outcome for a single M-Pesa transaction.
+
+    Only code that has actually confirmed the payment with the provider may build
+    this. Nothing in the callback path does so: ``DarajaClient`` cannot verify a
+    transaction, and tests build it explicitly to prove the settlement guard.
+    """
+
+    organization_id: str
+    transaction_id: str
+    amount: Decimal
+    currency: str
+    source: str
+
+
 class DarajaClient:
-    """Mockable Safaricom Daraja API client with transaction status inquiry."""
+    """Mockable Safaricom Daraja API client.
+
+    Transaction status verification is NOT implemented. The client never returns
+    a success-shaped result, because a synthetic success is indistinguishable
+    from genuine confirmation once it reaches the settlement path.
+    """
 
     def __init__(self, config: DarajaConfig | None = None):
         self.config = config
@@ -39,37 +83,46 @@ class DarajaClient:
         short_code: str | None = None,
         mock_response: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Queries Daraja Transaction Status API.
+        """Reports that no provider-side verification was performed.
 
-        External network calls are disabled by default unless explicitly configured with active sandbox/production credentials.
+        ``mock_response`` exists only so tests can inject a canned payload; a
+        mocked payload is never evidence and must not be passed from production
+        code.
         """
-        if mock_response:
+        if mock_response is not None:
             return mock_response
 
-        # Check if live credentials and active flag exist
-        if not self.config or not self.config.is_active or not self.config.consumer_key:
-            return {
-                "ResponseCode": "0",
-                "ResponseDescription": "Simulation / Sandbox verified (Live calls disabled)",
-                "ResultCode": "0",
-                "ResultDesc": "The service request is processed successfully.",
-                "TransactionStatus": "Completed",
-                "ReceiptNo": transaction_id,
-                "Amount": "0.00",
-                "ConversationID": "AG_SIM_20261027",
-            }
-
-        # In production/sandbox with actual credentials, an OAuth token is fetched and POST made.
-        # Keeping mock/safe fallback when live credentials are not authenticated.
         return {
-            "ResponseCode": "0",
-            "ResponseDescription": "Transaction Status Query Received",
-            "ResultCode": "0",
-            "ResultDesc": "Completed",
-            "TransactionStatus": "Completed",
+            "ResponseCode": "1",
+            "ResponseDescription": "Transaction status verification is not implemented",
+            "ResultCode": "1",
+            "ResultDesc": (
+                "No provider verification was performed. This response must not "
+                "be treated as payment evidence."
+            ),
+            "TransactionStatus": "UNVERIFIED",
+            "Verified": False,
             "ReceiptNo": transaction_id,
-            "ConversationID": "AG_SIM_LIVE",
         }
+
+    def verify_payment(self, transaction_id: str) -> VerifiedPaymentResult:
+        """Placeholder for genuine provider verification (not implemented)."""
+        raise DarajaVerificationUnavailable(
+            "Genuine Daraja transaction verification is not implemented; automatic "
+            "settlement from provider status remains disabled."
+        )
+
+
+def _resolve_deposit_account(organization: Organization) -> Account | None:
+    """Configured Daraja deposit account, else M-Pesa clearing (1020), else bank."""
+    daraja_cfg = getattr(organization, "daraja_config", None)
+    if daraja_cfg and daraja_cfg.default_deposit_account:
+        return daraja_cfg.default_deposit_account
+    return Account.objects.filter(
+        organization=organization, code="1020", is_active=True
+    ).first() or Account.objects.filter(
+        organization=organization, is_active=True, code__in=["1010", "1000"]
+    ).first()
 
 
 @transaction.atomic
@@ -232,25 +285,17 @@ def process_c2b_callback(
             )
             return {"ResultCode": "0", "ResultDesc": "Confirmation received for review"}
 
-    if (
-        existing_pending is None
-        and payment is None
-        and matched_invoice
-        and matched_invoice.currency == organization.currency
-        and amount <= matched_invoice.outstanding_balance
-    ):
-        # No prior PENDING payment; settle invoice directly via the authoritative service.
-        payment = record_and_confirm_customer_payment(
-            invoice_id=matched_invoice.id,
-            amount=amount,
-            deposit_account_id=deposit_account.id,
-            payment_method=PaymentMethod.MPESA,
-            reference=trans_id,
-            idempotency_key=f"daraja:c2b:{trans_id}",
-        )
+    # An unauthenticated Daraja confirmation is never sufficient on its own to
+    # settle an invoice. Automatic promotion happens only above, where the
+    # callback matches a PENDING payment the business itself initiated (bound by
+    # reference and validated for amount, currency, method and invoice state).
+    # A bare BillRefNumber match is treated as evidence for review, so we fall
+    # through and hold the funds as a PENDING payment below.
 
     if payment is None:
-        # No matching invoice or pending payment — record unallocated incoming payment.
+        # No initiated payment corroborates this callback — record the funds as an
+        # unallocated PENDING payment and hold the event for review. Nothing is
+        # settled and no journal is posted.
         pay_num = f"PAY-MPESA-{trans_id}"
         payment = Payment.objects.create(
             organization=organization,
@@ -277,9 +322,37 @@ def process_c2b_callback(
                 "amount": str(amount),
                 "bill_ref": bill_ref,
                 "payer": payer_name,
-                "reason": "Payment received without matching exact open invoice.",
+                "reason": "Callback could not be independently verified against an initiated payment; held for review.",
             },
         )
+
+        event.matched_payment = payment
+        event.status = DarajaCallbackStatus.HELD
+        event.error_message = (
+            "Held for review: no initiated payment matched this callback."
+        )
+        event.processed_at = timezone.now()
+        event.save(
+            update_fields=["matched_payment", "status", "error_message", "processed_at"]
+        )
+
+        record_audit_log(
+            action="HOLD_DARAJA_C2B_CALLBACK",
+            target_model="DarajaCallbackEvent",
+            target_id=str(event.id),
+            organization=organization,
+            details={
+                "trans_id": trans_id,
+                "amount": str(amount),
+                "payment_id": str(payment.id),
+                "reason": "no_initiated_payment",
+            },
+        )
+
+        return {
+            "ResultCode": "0",
+            "ResultDesc": "Confirmation received and held for verification",
+        }
 
     event.matched_payment = payment
     event.status = DarajaCallbackStatus.PROCESSED
@@ -371,30 +444,56 @@ def process_stk_callback(
     ).first()
 
     if payment:
-        # A PENDING payment with this reference already exists (e.g. an STK push was
-        # initiated before the callback arrived).  Promote through the full settlement
-        # lifecycle if it has a linked invoice; otherwise update reference only.
-        if payment.invoice_id and deposit_account:
-            inv = payment.invoice
-            if inv.status in (InvoiceStatus.ISSUED, InvoiceStatus.PARTIALLY_PAID):
-                payment = settle_pending_payment(
-                    pending_payment=payment,
-                    deposit_account=deposit_account,
-                    evidence_type="STK_PUSH_CALLBACK",
-                    idempotency_key=f"daraja:stk:settle:{receipt_no}",
-                )
-            else:
-                # Invoice already settled by a different path — update reference only.
-                payment.reference = receipt_no
-                payment.status = PaymentStatus.CONFIRMED
-                payment.save(update_fields=["status", "reference"])
+        # The callback is bound to a PENDING payment this system initiated
+        # (_resolve_daraja_org only returns an org for STK when such a payment
+        # exists). Independently verify the callback against that payment before
+        # promoting it; a success message alone is not proof.
+        amount_matches = amount == payment.amount
+        currency_matches = payment.currency == organization.currency
+        if (
+            amount_matches
+            and currency_matches
+            and payment.invoice_id
+            and deposit_account
+            and payment.invoice.status
+            in (InvoiceStatus.ISSUED, InvoiceStatus.PARTIALLY_PAID)
+        ):
+            payment = settle_pending_payment(
+                pending_payment=payment,
+                deposit_account=deposit_account,
+                evidence_type="STK_PUSH_CALLBACK",
+                idempotency_key=f"daraja:stk:settle:{receipt_no}",
+            )
         else:
-            # No invoice linked — update reference and status only (unallocated funds).
-            payment.reference = receipt_no
-            payment.status = PaymentStatus.CONFIRMED
-            payment.save(update_fields=["status", "reference"])
+            # Mismatched amount/currency, or no settleable invoice: this is
+            # evidence for review, never an automatic confirmation. Leave the
+            # initiated payment PENDING and record why verification is required.
+            event.matched_payment = payment
+            event.status = DarajaCallbackStatus.FAILED
+            event.error_message = (
+                "STK callback did not independently match an initiated payment "
+                "for settlement (amount, currency, or invoice state)."
+            )
+            event.processed_at = timezone.now()
+            event.save(
+                update_fields=["matched_payment", "status", "error_message", "processed_at"]
+            )
+            publish_outbox_event(
+                event_type="payment.verification_required",
+                organization=organization,
+                idempotency_key=f"stk:verify:{receipt_no}",
+                payload={
+                    "payment_id": str(payment.id),
+                    "receipt_no": receipt_no,
+                    "amount": str(amount),
+                    "reason": "STK callback did not match an initiated payment for automatic settlement.",
+                },
+            )
+            return {"ResultCode": "0", "ResultDesc": "STK callback held for verification"}
     else:
-        # Create payment record
+        # No initiated payment matched, yet the callback was attributable to an
+        # organization via its short code. Fail closed: never create a CONFIRMED
+        # payment from an unauthenticated callback. Hold the funds as PENDING.
         pay_num = f"PAY-STK-{receipt_no}"
         payment = Payment.objects.create(
             organization=organization,
@@ -404,25 +503,115 @@ def process_stk_callback(
             currency="KES",
             payment_date=timezone.now().date(),
             payment_method=PaymentMethod.MPESA,
-            status=PaymentStatus.CONFIRMED,
+            status=PaymentStatus.PENDING,
             reference=receipt_no,
             deposit_account=deposit_account,
         )
+        event.matched_payment = payment
+        event.status = DarajaCallbackStatus.HELD
+        event.error_message = (
+            "Held for review: STK success callback had no initiated payment to bind to."
+        )
+        event.processed_at = timezone.now()
+        event.save(
+            update_fields=["matched_payment", "status", "error_message", "processed_at"]
+        )
+        publish_outbox_event(
+            event_type="payment.verification_required",
+            organization=organization,
+            idempotency_key=f"stk:verify:{receipt_no}",
+            payload={
+                "payment_id": str(payment.id),
+                "receipt_no": receipt_no,
+                "amount": str(amount),
+                "reason": "STK success callback had no initiated payment to bind to.",
+            },
+        )
+        return {"ResultCode": "0", "ResultDesc": "STK callback held for verification"}
 
+    # Successful, independently verified settlement only.
     event.matched_payment = payment
     event.status = DarajaCallbackStatus.PROCESSED
     event.processed_at = timezone.now()
     event.save(update_fields=["matched_payment", "status", "processed_at"])
 
-    publish_outbox_event(
-        event_type="payment.confirmed",
-        organization=organization,
-        payload={
-            "payment_id": str(payment.id),
-            "payment_number": payment.payment_number,
-            "receipt_no": receipt_no,
-            "amount": str(amount),
-        },
-    )
+    if payment.status == PaymentStatus.CONFIRMED:
+        publish_outbox_event(
+            event_type="payment.confirmed",
+            organization=organization,
+            payload={
+                "payment_id": str(payment.id),
+                "payment_number": payment.payment_number,
+                "receipt_no": receipt_no,
+                "amount": str(amount),
+            },
+        )
 
     return {"ResultCode": "0", "ResultDesc": "STK callback processed successfully"}
+
+
+@transaction.atomic
+def settle_from_verified_result(
+    organization: Organization,
+    pending_payment: Payment,
+    evidence: VerifiedPaymentResult,
+) -> Payment:
+    """Settle a PENDING payment from independently verified provider evidence.
+
+    This is the reserved entry point for a future, genuine Daraja verification
+    implementation (or a test-controlled adapter). It is deliberately not called
+    from any callback view: until ``DarajaClient.verify_payment`` is implemented,
+    automatic settlement from provider status stays disabled.
+
+    Even with trusted evidence the settlement is re-validated against server-side
+    state, so a defective or malicious caller cannot settle the wrong tenant,
+    payment, amount, currency or invoice.
+
+    Raises:
+        DarajaAdapterError: if the evidence does not match the payment exactly.
+    """
+    if not isinstance(evidence, VerifiedPaymentResult):
+        raise DarajaAdapterError(
+            "Verified settlement requires VerifiedPaymentResult evidence."
+        )
+    if str(evidence.organization_id) != str(organization.id):
+        raise DarajaAdapterError("Verified evidence belongs to another organization.")
+
+    locked_payment = (
+        Payment.objects.select_for_update(of=("self",))
+        .select_related("invoice")
+        .filter(organization=organization)
+        .get(id=pending_payment.id)
+    )
+
+    if locked_payment.status != PaymentStatus.PENDING:
+        raise DarajaAdapterError("Only a PENDING payment can be settled from verified evidence.")
+    if not locked_payment.reference or evidence.transaction_id != locked_payment.reference:
+        raise DarajaAdapterError("Verified evidence does not match the payment reference.")
+    if evidence.amount != locked_payment.amount:
+        raise DarajaAdapterError("Verified evidence amount does not match the payment.")
+    if evidence.currency != locked_payment.currency:
+        raise DarajaAdapterError("Verified evidence currency does not match the payment.")
+    if not locked_payment.invoice_id:
+        raise DarajaAdapterError("Payment has no invoice to settle.")
+
+    invoice = locked_payment.invoice
+    if invoice.organization_id != organization.id:
+        raise DarajaAdapterError("Invoice belongs to another organization.")
+    if invoice.currency != evidence.currency:
+        raise DarajaAdapterError("Invoice currency does not match the verified evidence.")
+    if invoice.status not in (InvoiceStatus.ISSUED, InvoiceStatus.PARTIALLY_PAID):
+        raise DarajaAdapterError("Invoice is not open for settlement.")
+    if locked_payment.amount > invoice.outstanding_balance:
+        raise DarajaAdapterError("Payment exceeds the invoice outstanding balance.")
+
+    deposit_account = _resolve_deposit_account(organization)
+    if not deposit_account:
+        raise DarajaAdapterError("No active deposit account is configured.")
+
+    return settle_pending_payment(
+        pending_payment=locked_payment,
+        deposit_account=deposit_account,
+        evidence_type=f"VERIFIED_PROVIDER_RESULT:{evidence.source}",
+        idempotency_key=f"daraja:verified:{evidence.transaction_id}",
+    )

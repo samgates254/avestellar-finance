@@ -30,3 +30,9 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         token["email"] = user.email
         token["full_name"] = user.full_name
         return token
+
+
+class LogoutSerializer(serializers.Serializer):
+    """Validates the refresh token supplied to the logout/revocation endpoint."""
+
+    refresh = serializers.CharField()
