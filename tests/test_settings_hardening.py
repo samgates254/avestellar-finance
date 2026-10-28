@@ -60,11 +60,18 @@ _VALID_STAGING = {
     "DATABASE_URL": "postgresql://staging_user:staging_pass@db.example.com:5432/avestellar",
 }
 
+# Synthetic value so an isolated subprocess never depends on an untracked .env.
+_SYNTHETIC_SECRET_KEY = "synthetic-secret-for-isolated-settings-tests"
+
 
 def _run(env_overrides: dict[str, str], script: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     for key in _NEUTRALIZED_KEYS:
         env.pop(key, None)
+    # SECRET_KEY is required in *every* profile, and scenarios run without the
+    # developer's .env, so the helper supplies its own synthetic value. A test
+    # that needs an absent/blank key overrides it explicitly.
+    env["SECRET_KEY"] = _SYNTHETIC_SECRET_KEY
     env.update(env_overrides)
     return subprocess.run(
         [sys.executable, "-c", script],

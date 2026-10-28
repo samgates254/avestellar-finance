@@ -82,7 +82,7 @@ CI-specific inputs:
 
 | Variable | Value | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | `postgresql://avestellar_ci:…@127.0.0.1:5432/avestellar_ci` | DDL admin connection for the throwaway service container |
+| `DATABASE_URL` | `postgresql://avestellar_ci:<password>@127.0.0.1:5432/avestellar_ci` (synthetic) | DDL admin connection for the throwaway service container |
 | `E2E_AV_DATABASE_NAME` | `avestellar_live_http_ci_e2e` | disposable database, prefix enforced by the runner |
 | `E2E_DJANGO_PORT` / `E2E_NEXT_PORT` | `8200` / `3100` | isolated ports; the runner refuses `8000` |
 | `E2E_DROP_DB` | `0` | the service container is destroyed with the runner, so the drop path is not exercised in CI |
