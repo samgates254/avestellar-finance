@@ -13,9 +13,11 @@ AVESTELLAR FINANCE is an API-first accounting, double-entry general ledger, and 
 
 ## 2. Technology Stack
 
-- **Language**: Python 3.14
+- **Language**: Python 3.14.4, pinned once in `.python-version`; CI installs
+exactly that release
 - **Framework**: Django 5.2 LTS & Django REST Framework 3.16
-- **Database**: PostgreSQL 16 (via `psycopg 3.3.6`)
+- **Database**: PostgreSQL 16–18 (via `psycopg 3.3.6`); CI runs the backend suite
+  on both 16 and 18 and pins browser E2E to 16, the staging major
 - **Authentication**: JWT (`djangorestframework-simplejwt 5.5`)
 - **API Documentation**: OpenAPI 3.0 via `drf-spectacular 0.28`
 - **Environment**: `django-environ 0.12`
@@ -47,7 +49,7 @@ avestellar-finance/
 ## 4. Getting Started
 
 ### 4.1 Prerequisites
-- Python 3.14+
+- Python 3.14.4 (the exact release named in `.python-version`)
 - PostgreSQL 16+ running locally or in Docker
 
 ### 4.2 Configuration
@@ -58,15 +60,27 @@ cp .env.example .env
 
 Ensure your PostgreSQL database is created:
 ```bash
-# Example local postgres connection
-export PGPASSWORD=avestellar
-psql -h 127.0.0.1 -p 5433 -U avestellar -c "CREATE DATABASE avestellar_finance;"
+# Example local postgres connection. Substitute your OWN local role/password;
+# never commit or share a working credential.
+export PGPASSWORD=YOUR_LOCAL_POSTGRES_PASSWORD
+psql -h 127.0.0.1 -p 5433 -U YOUR_LOCAL_USER -c "CREATE DATABASE avestellar_finance;"
 ```
 
 Update `.env` database URL:
 ```ini
-DATABASE_URL=postgresql://avestellar:avestellar@127.0.0.1:5433/avestellar_finance
+DATABASE_URL=postgresql://YOUR_LOCAL_USER:YOUR_LOCAL_PASSWORD@127.0.0.1:5433/avestellar_finance
 ```
+
+Configuration is profile-driven. `.env.example` ships `DJANGO_ENV=development` and
+`DEBUG=True`; `staging` / `production` (or any run with `DEBUG=False`) enforce
+strict validation and refuse to boot without a real `SECRET_KEY`, explicit
+`ALLOWED_HOSTS`, and a PostgreSQL `DATABASE_URL`. Unknown `DJANGO_ENV` values and
+known placeholder secrets are rejected. See `docs/staging_deployment.md` for the
+full fail-closed matrix and the provider-secret limitations.
+
+> `.env` is gitignored and must never be committed. `SECRET_KEY`, `DATABASE_URL`,
+> and provider credentials are environment-specific and are supplied out of band
+> (secret manager / platform env), not from `.env.example`.
 
 ### 4.3 Database Migrations
 Apply migrations to PostgreSQL:
@@ -97,12 +111,42 @@ python manage.py check
 python manage.py makemigrations --check --dry-run
 python manage.py migrate --check
 
-# 3. Run full automated test suite (82 passing tests)
-pytest -q
+# 3. Run full automated test suite (269 backend tests, 21 frontend unit tests,
+#    10 browser E2E journeys)
+pytest -q --create-db
 
 # 4. Validate OpenAPI documentation schema
 python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
 ```
+
+Security-focused suites:
+```bash
+pytest tests/test_settings_hardening.py tests/test_cache_configuration.py \
+       tests/test_auth_security.py tests/test_daraja_callback.py \
+       tests/test_provider_secrets.py tests/test_statement_upload_limits.py \
+       tests/test_no_committed_credentials.py tests/test_dependency_pinning.py \
+       tests/test_ci_workflows.py -q
+```
+
+### 5.1 Continuous integration
+
+`.github/workflows/ci.yml` runs three independent jobs on every push to `main`
+and `feat/**`, on every pull request, and on demand:
+
+| Job | Gates |
+| --- | --- |
+| `backend` | system checks, migration drift, the security suites above, the full PostgreSQL suite on **16 and 18**, OpenAPI validation, staging `check --deploy` |
+| `frontend` | `pnpm install --frozen-lockfile`, lint, typecheck, unit tests, production build |
+| `browser-e2e` | the 10 real-HTTP Playwright journeys via `scripts/run_browser_e2e.sh` against a disposable PostgreSQL 16 database |
+
+Each job gets its own throwaway PostgreSQL service container and synthetic
+credentials; no job reads a `.env` file, references a repository secret, or
+reaches a payment provider. The interpreter version is read from
+`.python-version`, so the workflow holds no competing hardcoded Python version.
+See [docs/ci_release_gates.md](docs/ci_release_gates.md)
+for the blocking criteria, local reproduction of failures, the database
+isolation model, the CI secrets policy, and how staging enables shared-cache
+throttling.
 
 ---
 
@@ -111,7 +155,8 @@ python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
 ### Authentication & Identity
 - `POST /api/v1/auth/register/` - Register new user
 - `POST /api/v1/auth/token/` - Obtain JWT token pair
-- `POST /api/v1/auth/token/refresh/` - Refresh JWT token
+- `POST /api/v1/auth/token/refresh/` - Refresh JWT token (rotates + blacklists the old one)
+- `POST /api/v1/auth/logout/` - Revoke the caller's refresh token (authenticated, idempotent)
 - `GET /api/v1/auth/me/` - Retrieve authenticated user profile
 
 ### Organizations & Multi-Tenancy
@@ -211,6 +256,7 @@ python manage.py spectacular --validate --file /tmp/avestellar-openapi.yaml
 - Safaricom Daraja Callback Integration: [docs/daraja_callback_integration.md](file:///home/mr-robot/Projects/avestellar-finance/docs/daraja_callback_integration.md)
 - Comprehensive Financial Metrics Catalog: [docs/financial_metrics_catalog.md](file:///home/mr-robot/Projects/avestellar-finance/docs/financial_metrics_catalog.md)
 - Core Architectural Specifications: [docs/architecture_and_flywheel.md](file:///home/mr-robot/Projects/avestellar-finance/docs/architecture_and_flywheel.md)
+- CI & Release Gates: [docs/ci_release_gates.md](file:///home/mr-robot/Projects/avestellar-finance/docs/ci_release_gates.md)
 
 ---
 
