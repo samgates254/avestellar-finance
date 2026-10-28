@@ -621,6 +621,11 @@ class TestPaymentPendingToConfirmedLifecycle:
     def test_c2b_callback_replay_does_not_double_settle(self):
         invoice = self._make_invoice("15000.00", "INV-LC-REPLAY-1")
         issued = issue_invoice(invoice.id, user=self.user)
+        # Only a callback that matches a business-initiated PENDING payment bound
+        # to the transaction reference may settle the invoice.
+        self._make_pending_payment(
+            issued, "15000.00", "MPESA-REPLAY-01", "PAY-PEND-REPLAY-01"
+        )
 
         payload = {
             "TransID": "MPESA-REPLAY-01",
@@ -650,6 +655,28 @@ class TestPaymentPendingToConfirmedLifecycle:
 
         issued.refresh_from_db()
         assert issued.paid_amount == Decimal("15000.0000")
+
+    def test_c2b_bare_callback_does_not_settle_without_initiated_payment(self):
+        """A confirmation matching only a BillRefNumber is held, never settled."""
+        invoice = self._make_invoice("8000.00", "INV-LC-BARE-1")
+        issued = issue_invoice(invoice.id, user=self.user)
+
+        result = process_c2b_callback(
+            organization=self.org,
+            payload={
+                "TransID": "MPESA-BARE-01",
+                "TransAmount": "8000.00",
+                "BillRefNumber": "INV-LC-BARE-1",
+            },
+        )
+        assert result["ResultCode"] == "0"
+
+        issued.refresh_from_db()
+        assert issued.status != InvoiceStatus.PAID
+        payment = Payment.objects.get(
+            organization=self.org, reference="MPESA-BARE-01"
+        )
+        assert payment.status == PaymentStatus.PENDING
 
     # -------------------------------------------------------------------------
     # 12. Transaction rollback leaves no partial changes
