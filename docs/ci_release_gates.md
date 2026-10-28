@@ -118,7 +118,9 @@ tests/test_dependency_pinning.py
 `pull_request_target`, no `secrets.*` references, read-only token, pinned action
 tags, no `continue-on-error`, no step loading a `.env`, service containers that
 are health-checked throwaway PostgreSQL, Python selected through `.python-version`
-rather than a competing literal, and no real credentials in the YAML.
+rather than a competing literal, every JavaScript action floored at a reference
+whose `action.yml` declares `runs.using: node24`, and no real credentials in the
+YAML.
 
 ### 1.5 Runtime versions
 
@@ -128,6 +130,7 @@ rather than a competing literal, and no real credentials in the YAML.
 | Node.js | `ci.yml` (`setup-node`) | 22 |
 | pnpm | `ci.yml` (`pnpm/action-setup`) | 12.10.1 |
 | PostgreSQL | `ci.yml` matrix / E2E service | 16 and 18 (backend); 16 (E2E) |
+| Action runtime | each action's own `action.yml` (`runs.using`) | Node.js 24 |
 
 `.python-version` is the single source of truth for Python: no workflow step
 repeats the number, and `test_ci_workflows.py` fails if one reappears. That pin
@@ -135,6 +138,20 @@ is honoured by pyenv, uv, and setup-python — but **not by every deployment
 platform**. Heroku-style buildpacks want `runtime.txt`, container builds must pin
 the base image, and consoles with a Python setting must be told 3.14.4. See
 §2a of `docs/staging_deployment.md`.
+
+GitHub removed the Node.js 20 runtime from hosted runners, so the JavaScript
+actions themselves have to run on Node.js 24. The workflow therefore uses
+`actions/checkout@v7`, `actions/setup-python@v7`, `actions/setup-node@v7`,
+`actions/cache@v5`, `actions/upload-artifact@v7` and
+`pnpm/action-setup@v4.4.0`; each of those tags was read and confirms
+`runs.using: node24`. `test_ci_workflows.py` records the verified floor per action
+and fails on anything older, and rejects
+`ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` so the warning cannot be silenced
+instead of fixed. Node.js 24 actions need a runner at **2.327.1 or newer**;
+GitHub-hosted `ubuntu-latest` satisfies that, self-hosted runners must be
+upgraded first. This is the runtime *of the actions*, not of the application:
+the frontend still builds on Node.js 22 and Python still comes from
+`.python-version`.
 
 ---
 
