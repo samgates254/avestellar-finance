@@ -76,10 +76,10 @@ jobs:
       DATABASE_URL: postgresql://avestellar_ci:ci_synthetic_password@127.0.0.1:5432/avestellar_ci
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           # Single source of truth: the repository pin. No competing literal
           # survives in this file, so CI cannot drift from .python-version.
@@ -160,7 +160,7 @@ jobs:
 
       - name: Upload OpenAPI schema
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openapi-schema
           path: /tmp/avestellar-openapi.yaml
@@ -176,16 +176,16 @@ jobs:
         working-directory: frontend
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v4.4.0
         with:
           version: 12.10.1
           run_install: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: pnpm
@@ -237,10 +237,10 @@ jobs:
       E2E_DROP_DB: "0"
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           # Single source of truth: the repository pin. No competing literal
           # survives in this file, so CI cannot drift from .python-version.
@@ -254,13 +254,13 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v4.4.0
         with:
           version: 12.10.1
           run_install: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: pnpm
@@ -271,7 +271,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('frontend/pnpm-lock.yaml') }}
@@ -294,7 +294,7 @@ jobs:
 
       - name: Upload Playwright diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-diagnostics
           path: |
